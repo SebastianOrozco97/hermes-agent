@@ -1,0 +1,18 @@
+Run one crypto market vigilance pass in the current workspace.
+
+Objectives:
+- Collect BTC, ETH, and SOL spot prices plus BTC 24h volume.
+- Persist the snapshot locally in registro_vigilancia.xlsx.
+- Send a concise WhatsApp summary only after the local file write succeeds.
+- Return the timestamp, workbook path, and delivery status.
+
+Preferred path:
+- If a workspace-root script named bucle_confianza.py exists, use it as the primary path.
+- Use python bucle_confianza.py for the normal one-shot run.
+- Use python bucle_confianza.py --no-whatsapp only when the task is explicitly a dry run.
+
+Hard limits:
+- Do not place trades.
+- Do not open Binance.
+- Do not alter any exchange state.
+- Do not widen scope into browsing or terminal admin work unrelated to the vigilance pass.

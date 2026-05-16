@@ -1,0 +1,29 @@
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        nodejs \
+        npm \
+        procps \
+        psmisc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp/hermes-agent
+COPY . /tmp/hermes-agent
+
+RUN pip install --no-cache-dir \
+        ".[messaging,pty,mcp,cli,cron,google,homeassistant,sms,web,acp,youtube]" \
+    && npm --prefix /tmp/hermes-agent/scripts/whatsapp-bridge install --omit=dev \
+    && npm cache clean --force
+
+WORKDIR /app
+
+CMD ["hermes", "gateway"]
