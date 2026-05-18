@@ -94,7 +94,9 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    # WhatsApp technically supports edit through the bridge, but operator chat
+    # quality is better when raw tool names stay hidden by default.
+    "whatsapp":        {**_TIER_MEDIUM, "tool_progress": "off"},
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,

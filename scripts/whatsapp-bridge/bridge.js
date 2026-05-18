@@ -18,7 +18,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -27,7 +27,9 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlink
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
+import { inspect } from 'util';
 import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
 // Parse CLI args
@@ -49,6 +51,7 @@ const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cac
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 const PAIR_ONLY = args.includes('--pair-only');
+const QR_PNG_PATH = getArg('qr-png', process.env.WHATSAPP_QR_PNG_PATH || path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'pairing-qr.png'));
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
@@ -65,6 +68,33 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function serializeUnknownError(value) {
+  if (value instanceof Error) {
+    return pino.stdSerializers.err(value);
+  }
+  if (value && typeof value === 'object') {
+    const serialized = {};
+    for (const key of Object.getOwnPropertyNames(value)) {
+      try {
+        serialized[key] = value[key];
+      } catch {}
+    }
+    serialized.inspect = inspect(value, { depth: 6, breakLength: 120 });
+    return serialized;
+  }
+  return value;
+}
+
+function describeError(value) {
+  if (value instanceof Error) {
+    return value.stack || value.message;
+  }
+  if (value && typeof value === 'object') {
+    return inspect(value, { depth: 6, breakLength: 120 });
+  }
+  return String(value);
 }
 
 function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
@@ -164,7 +194,28 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
-const logger = pino({ level: 'warn' });
+const logger = pino({
+  level: 'warn',
+  serializers: {
+    err: serializeUnknownError,
+    error: serializeUnknownError,
+    ackErr: serializeUnknownError,
+    retryErr: serializeUnknownError,
+    uploadErr: serializeUnknownError,
+  },
+});
+
+process.on('uncaughtExceptionMonitor', (error, origin) => {
+  console.error('[bridge] uncaughtExceptionMonitor:', origin, error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[bridge] unhandledRejection:', reason);
+});
+
+process.on('exit', (code) => {
+  console.log(`[bridge] process exiting with code ${code}`);
+});
 
 // Message queue for polling
 const messageQueue = [];
@@ -176,14 +227,52 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let reconnectTimer = null;
+
+function scheduleSocketRestart(delayMs, reason) {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+  }
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startSocket().catch((error) => {
+      console.error(`[bridge] startSocket failed after ${reason}:`, describeError(error));
+      scheduleSocketRestart(3000, 'startSocket retry');
+    });
+  }, delayMs);
+}
+
+async function writeQrPng(qr) {
+  try {
+    if (!QR_PNG_PATH) return;
+    mkdirSync(path.dirname(QR_PNG_PATH), { recursive: true });
+    await QRCode.toFile(QR_PNG_PATH, qr, {
+      type: 'png',
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      scale: 8,
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF',
+      },
+    });
+    console.log(`🖼️  QR image saved to: ${QR_PNG_PATH}`);
+  } catch (err) {
+    console.log(`⚠️  Failed to save QR image: ${err?.message || err}`);
+  }
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
+  const authState = {
+    ...state,
+    keys: makeCacheableSignalKeyStore(state.keys, logger),
+  };
 
   sock = makeWASocket({
     version,
-    auth: state,
+    auth: authState,
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
@@ -206,12 +295,14 @@ async function startSocket() {
     if (qr) {
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
+      void writeQrPng(qr);
       console.log('\nWaiting for scan...\n');
     }
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
+      const disconnectDetails = lastDisconnect?.error ? describeError(lastDisconnect.error) : 'n/a';
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -222,8 +313,11 @@ async function startSocket() {
           console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
         } else {
           console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+          if (disconnectDetails !== 'n/a') {
+            console.log(`[bridge] disconnect details: ${disconnectDetails}`);
+          }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        scheduleSocketRestart(reason === 515 ? 1000 : 3000, `connection close ${reason}`);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -263,6 +357,13 @@ async function startSocket() {
       const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
+      const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+      const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+      const chatNumber = chatId.replace(/@.*/, '');
+      const senderCanonical = senderId.replace(/@.*/, '');
+      const isOwnChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+      const isOwnSender = (myNumber && senderCanonical === myNumber) || (myLid && senderCanonical === myLid);
+      const isSelfChatMessage = !!(isOwnChat && isOwnSender);
 
       // Handle fromMe messages based on mode
       if (msg.key.fromMe) {
@@ -274,23 +375,18 @@ async function startSocket() {
         }
 
         // Self-chat mode: only allow messages in the user's own self-chat
-        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-        // AND classic format: 34652029134@s.whatsapp.net
-        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-        if (!isSelfChat) continue;
+        if (!isOwnChat) continue;
       }
 
       // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
+      // In self-chat mode, companion-delivered messages to your own note-to-self
+      // chat can arrive as !fromMe even though both chatId and senderId are yours.
+      // Allow only that exact case; stranger DMs / groups must still be rejected.
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
+          if (isSelfChatMessage) {
+            // Allow self-chat deliveries that arrive as !fromMe from another device.
+          } else {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -299,7 +395,8 @@ async function startSocket() {
               senderId,
             }));
           } catch {}
-          continue;
+            continue;
+          }
         }
         if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
@@ -400,8 +497,9 @@ async function startSocket() {
         body = `[${mediaType} received]`;
       }
 
-      // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
-      if (msg.key.fromMe && ((REPLY_PREFIX && body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
+      // Ignore Hermes' own reply messages in self-chat mode to avoid loops,
+      // even if WhatsApp delivers them back through a companion as !fromMe.
+      if (WHATSAPP_MODE === 'self-chat' && ((REPLY_PREFIX && body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
         if (WHATSAPP_DEBUG) {
           try { console.log(JSON.stringify({ event: 'ignored', reason: 'agent_echo', chatId, messageId: msg.key.id })); } catch {}
         }
@@ -709,7 +807,10 @@ if (PAIR_ONLY) {
   console.log('📱 WhatsApp pairing mode');
   console.log(`📁 Session: ${SESSION_DIR}`);
   console.log();
-  startSocket();
+  startSocket().catch((error) => {
+    console.error('[bridge] initial startSocket failed:', describeError(error));
+    process.exit(1);
+  });
 } else {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
@@ -724,6 +825,9 @@ if (PAIR_ONLY) {
       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
     }
     console.log();
-    startSocket();
+    startSocket().catch((error) => {
+      console.error('[bridge] initial startSocket failed:', describeError(error));
+      scheduleSocketRestart(3000, 'initial startup');
+    });
   });
 }

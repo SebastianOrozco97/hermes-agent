@@ -434,6 +434,10 @@ def is_local_endpoint(base_url: str) -> bool:
     # Docker / Podman / Lima internal DNS names (e.g. host.docker.internal)
     if any(host.endswith(suffix) for suffix in _CONTAINER_LOCAL_SUFFIXES):
         return True
+    # Docker bridge service names like ``ollama-local`` are single-label
+    # hostnames resolved only inside the local container network.
+    if host and "." not in host and ":" not in host:
+        return True
     # RFC-1918 private ranges, link-local, and Tailscale CGNAT
     try:
         addr = ipaddress.ip_address(host)
@@ -1022,6 +1026,51 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
             for key, value in model_info.items():
                 if "context_length" in key and isinstance(value, (int, float)):
                     return int(value)
+    except Exception:
+        pass
+    return None
+
+
+def query_ollama_capabilities(model: str, base_url: str, api_key: str = "") -> Optional[set[str]]:
+    """Query an Ollama server for the model's advertised capabilities.
+
+    Returns a lowercase set such as ``{"completion"}`` or
+    ``{"completion", "tools", "vision"}``. Returns None when the
+    server is unreachable, is not Ollama, or does not advertise the field.
+    """
+    import httpx
+
+    bare_model = _strip_provider_prefix(model)
+    server_url = base_url.rstrip("/")
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+
+    try:
+        server_type = detect_local_server_type(base_url, api_key=api_key)
+    except Exception:
+        return None
+    if server_type != "ollama":
+        return None
+
+    headers = _auth_headers(api_key)
+
+    try:
+        with httpx.Client(timeout=3.0, headers=headers) as client:
+            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            caps = data.get("capabilities")
+            if isinstance(caps, str):
+                caps = [caps]
+            if not isinstance(caps, list):
+                return None
+            normalized = {
+                str(cap).strip().lower()
+                for cap in caps
+                if isinstance(cap, str) and cap.strip()
+            }
+            return normalized or None
     except Exception:
         pass
     return None

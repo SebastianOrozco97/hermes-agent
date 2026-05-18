@@ -142,6 +142,37 @@ def get_hermes_dir(new_subpath: str, old_name: str) -> Path:
     return home / new_subpath
 
 
+def resolve_whatsapp_bridge_script() -> Path:
+    """Locate the bundled WhatsApp bridge script across install layouts.
+
+    Editable installs and bind-mounted Docker worktrees keep the bridge under
+    the repository checkout, while wheel installs resolve relative to the
+    installed package tree. Prefer an explicit env override when present, then
+    return the first existing candidate.
+    """
+    override = os.getenv("HERMES_WHATSAPP_BRIDGE_SCRIPT", "").strip()
+    if override:
+        return Path(override)
+
+    candidates = [
+        Path(__file__).resolve().parent / "scripts" / "whatsapp-bridge" / "bridge.js",
+        Path("/app/hermes-agent/scripts/whatsapp-bridge/bridge.js"),
+        Path.cwd() / "hermes-agent" / "scripts" / "whatsapp-bridge" / "bridge.js",
+        Path.cwd() / "scripts" / "whatsapp-bridge" / "bridge.js",
+    ]
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        marker = str(candidate.resolve(strict=False))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
+
+
 def display_hermes_home() -> str:
     """Return a user-friendly display string for the current HERMES_HOME.
 

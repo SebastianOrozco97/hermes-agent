@@ -53,7 +53,13 @@ model:
   #   Set manually only when auto-detection is wrong (e.g. a local server with
   #   a custom num_ctx, or a proxy that doesn't expose /v1/models).
   #
+  # short_context_mode: EXPERIMENTAL opt-in for small local models that expose
+  #   less than Hermes' normal 64K minimum. When enabled, Hermes allows startup
+  #   below that floor but disables automatic context compression for the session.
+  #   Use only for short chats, frequent resets, and tightly scoped tasks.
+  #
   # context_length: 131072
+  # short_context_mode: true
   #
   # max_tokens: OUTPUT cap — maximum tokens the model may generate per response.
   #   Unrelated to how long your conversation history can be.

@@ -155,7 +155,7 @@ from agent.model_metadata import (
     get_next_probe_tier, parse_context_limit_from_error,
     parse_available_output_tokens_from_error,
     save_context_length, is_local_endpoint,
-    query_ollama_num_ctx,
+    query_ollama_num_ctx, query_ollama_capabilities,
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -2173,6 +2173,14 @@ class AIAgent:
         # Read explicit model output-token override from config when the
         # caller did not pass one directly.
         _model_cfg = _agent_cfg.get("model", {})
+        if isinstance(_model_cfg, dict):
+            _short_context_mode = str(_model_cfg.get("short_context_mode", False)).lower() in {"true", "1", "yes"}
+        else:
+            _short_context_mode = False
+        self._short_context_mode = _short_context_mode
+        self._short_context_active = False
+        self._short_context_tools_disabled = False
+        _short_context_warning = None
         if self.max_tokens is None and isinstance(_model_cfg, dict):
             _config_max_tokens = _model_cfg.get("max_tokens")
             if _config_max_tokens is not None:
@@ -2373,13 +2381,29 @@ class AIAgent:
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
         _ctx = getattr(self.context_compressor, "context_length", 0)
         if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
-            raise ValueError(
-                f"Model {self.model} has a context window of {_ctx:,} tokens, "
-                f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
-                f"by Hermes Agent.  Choose a model with at least "
-                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context, or set "
-                f"model.context_length in config.yaml to override."
-            )
+            if self._short_context_mode:
+                compression_enabled = False
+                self.compression_enabled = False
+                self._short_context_active = True
+                _short_context_warning = (
+                    f"⚠ Short-context mode enabled for {self.model}: detected context is "
+                    f"{_ctx:,} tokens, below Hermes' normal {MINIMUM_CONTEXT_LENGTH:,}-token floor. "
+                    "Automatic context compression is disabled for this session. "
+                    "Keep requests short, prefer fresh sessions, and /reset often."
+                )
+                logger.warning(
+                    "Short-context mode enabled for %s with %s tokens; disabling compression for this session",
+                    self.model,
+                    f"{_ctx:,}",
+                )
+            else:
+                raise ValueError(
+                    f"Model {self.model} has a context window of {_ctx:,} tokens, "
+                    f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
+                    f"by Hermes Agent.  Choose a model with at least "
+                    f"{MINIMUM_CONTEXT_LENGTH // 1000}K context, or set "
+                    f"model.context_length in config.yaml to override."
+                )
 
         # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand).
         # Skip names that are already present — the get_tool_definitions()
@@ -2419,6 +2443,39 @@ class AIAgent:
                 )
             except Exception as _ce_err:
                 logger.debug("Context engine on_session_start: %s", _ce_err)
+
+        if self._short_context_active and self.base_url:
+            try:
+                _ollama_caps = query_ollama_capabilities(
+                    self.model,
+                    self.base_url,
+                    api_key=self.api_key or "",
+                )
+            except Exception as _caps_err:
+                _ollama_caps = None
+                logger.debug("Ollama capability detection failed: %s", _caps_err)
+            if _ollama_caps is not None and "tools" not in _ollama_caps:
+                self.tools = []
+                self.valid_tool_names = set()
+                self._context_engine_tool_names = set()
+                self._tool_use_enforcement = False
+                self._short_context_tools_disabled = True
+                _caps_label = ", ".join(sorted(_ollama_caps)) or "none"
+                _tool_warning = (
+                    f" Tool calling is disabled for this session because Ollama reports capabilities: {_caps_label}."
+                )
+                if _short_context_warning:
+                    _short_context_warning += _tool_warning
+                else:
+                    _short_context_warning = (
+                        f"⚠ Short-context session for {self.model} has tool calling disabled because "
+                        f"Ollama reports capabilities: {_caps_label}."
+                    )
+                logger.warning(
+                    "Disabled tools for short-context session on %s; Ollama capabilities=%s",
+                    self.model,
+                    _caps_label,
+                )
 
         self._subdirectory_hints = SubdirectoryHintTracker(
             working_dir=os.getenv("TERMINAL_CWD") or None,
@@ -2494,6 +2551,9 @@ class AIAgent:
         # in _compression_warning and replayed in the first run_conversation().
         self._compression_warning = None
         self._check_compression_model_feasibility()
+        if _short_context_warning and self._compression_warning is None:
+            self._compression_warning = _short_context_warning
+            self._emit_status(_short_context_warning)
 
         # Snapshot primary runtime for per-turn restoration.  When fallback
         # activates during a turn, the next turn restores these values so the
@@ -5996,6 +6056,62 @@ class AIAgent:
 
 
 
+
+    def _build_short_context_no_tools_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
+        """Build a compact prompt for degraded short-context local sessions.
+
+        When Hermes is forced into short-context mode and Ollama reports no tool
+        support, the normal agentic prompt wastes tokens and materially increases
+        latency on small local models. Keep only the identity, the active runtime
+        facts, and a terse platform hint.
+        """
+        stable_parts: List[str] = []
+
+        stable_parts.append(
+            "You are Hermes Agent on a constrained local runtime. "
+            "Answer directly, factually, and briefly in plain text."
+        )
+
+        runtime_facts = [
+            "Session constraints: short-context local model, no tool calling, no context compression.",
+        ]
+        if self.model:
+            runtime_facts.append(
+                f"Current runtime model: {self.model}. "
+                "If asked what model you use, answer with this exact model name."
+            )
+        if self.provider == "custom":
+            runtime_facts.append("Provider path: local Ollama-compatible endpoint.")
+        stable_parts.append(" ".join(runtime_facts))
+        stable_parts.append(
+            "If a higher-risk action is discussed, treat any external verifier as review-only and do not present it as the default chat model. "
+            "Do not claim that live trading is enabled."
+        )
+        stable_parts.append(
+            "Reply in the same language as the latest user message. "
+            "If the user writes in Spanish, respond in Spanish."
+        )
+
+        platform_key = (self.platform or "").lower().strip()
+        if platform_key == "whatsapp":
+            stable_parts.append(
+                "WhatsApp chat: plain text only. Keep replies to 1 to 2 short sentences by default."
+            )
+        elif platform_key:
+            stable_parts.append(
+                f"Platform: {platform_key}. Keep replies concise and do not promise unavailable tools."
+            )
+
+        context_parts: List[str] = []
+        if system_message is not None:
+            context_parts.append(system_message)
+
+        return {
+            "stable": "\n\n".join(p.strip() for p in stable_parts if p and p.strip()),
+            "context": "\n\n".join(p.strip() for p in context_parts if p and p.strip()),
+            "volatile": "",
+        }
+
     def _build_system_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
         """Assemble the system prompt as three ordered parts.
 
@@ -6014,6 +6130,9 @@ class AIAgent:
         session — that's the only way to keep upstream prompt caches
         warm across turns.
         """
+        if self._short_context_active and self._short_context_tools_disabled:
+            return self._build_short_context_no_tools_prompt_parts(system_message=system_message)
+
         # ── Stable tier ────────────────────────────────────────────────
         stable_parts: List[str] = []
 
@@ -7998,6 +8117,15 @@ class AIAgent:
         return (
             self.stream_delta_callback is not None
             or getattr(self, "_stream_callback", None) is not None
+        )
+
+    def _prefer_non_streaming_completion(self) -> bool:
+        """Use non-streaming for degraded local short-context chat sessions."""
+        return bool(
+            self._short_context_active
+            and self._short_context_tools_disabled
+            and self.base_url
+            and is_local_endpoint(self.base_url)
         )
 
     def _interruptible_streaming_api_call(
@@ -12947,6 +13075,8 @@ class AIAgent:
                         or str(self.base_url or "").lower().startswith("acp://copilot")
                         or str(self.base_url or "").lower().startswith("acp+tcp://")
                     ):
+                        _use_streaming = False
+                    elif self._prefer_non_streaming_completion():
                         _use_streaming = False
                     elif not self._has_stream_consumers():
                         # No display/TTS consumer. Still prefer streaming for

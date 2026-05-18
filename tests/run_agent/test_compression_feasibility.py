@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE, PLATFORM_HINTS
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
 
@@ -273,6 +274,228 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         provider="",
         custom_providers=[],
     )
+
+
+def test_init_rejects_short_context_model_by_default():
+    """Below-64K main models still fail startup unless short_context_mode is enabled."""
+
+    class _StubCompressor:
+        def __init__(self, *args, **kwargs):
+            self.context_length = 8_192
+            self.threshold_tokens = 64_000
+            self.threshold_percent = 0.50
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_start(self, *args, **kwargs):
+            return None
+
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("run_agent.ContextCompressor", new=_StubCompressor),
+    ):
+        with pytest.raises(ValueError) as exc_info:
+            AIAgent(
+                model="gemma2:2b",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+    err = str(exc_info.value)
+    assert "gemma2:2b" in err
+    assert "8,192" in err
+    assert "64,000" in err
+    assert "below the minimum" in err
+
+
+def test_init_allows_short_context_mode_and_disables_compression():
+    """short_context_mode allows startup below 64K but forces compression off."""
+
+    class _StubCompressor:
+        def __init__(self, *args, **kwargs):
+            self.context_length = 8_192
+            self.threshold_tokens = 64_000
+            self.threshold_percent = 0.50
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_start(self, *args, **kwargs):
+            return None
+
+    cfg = {
+        "model": {
+            "short_context_mode": True,
+        },
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("run_agent.ContextCompressor", new=_StubCompressor),
+    ):
+        agent = AIAgent(
+            model="gemma2:2b",
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._short_context_mode is True
+    assert agent._short_context_active is True
+    assert agent.compression_enabled is False
+    assert agent._compression_warning is not None
+    assert "Short-context mode enabled" in agent._compression_warning
+    assert "8,192" in agent._compression_warning
+
+
+def test_init_short_context_mode_disables_tools_when_ollama_model_lacks_them():
+    """Short-context mode should also drop the tool surface for Ollama models
+    that advertise no tool support, preventing HTTP 400 tool-schema errors."""
+
+    class _StubCompressor:
+        def __init__(self, *args, **kwargs):
+            self.context_length = 8_192
+            self.threshold_tokens = 64_000
+            self.threshold_percent = 0.50
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_start(self, *args, **kwargs):
+            return None
+
+    cfg = {
+        "model": {
+            "short_context_mode": True,
+        },
+    }
+    fake_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "description": "memory tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=fake_tools),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("run_agent.ContextCompressor", new=_StubCompressor),
+        patch("run_agent.query_ollama_capabilities", return_value={"completion"}),
+        patch("run_agent.query_ollama_num_ctx", return_value=8_192),
+    ):
+        agent = AIAgent(
+            model="gemma2:2b",
+            api_key="test-key-1234567890",
+            base_url="http://ollama-local:11434/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._short_context_mode is True
+    assert agent._short_context_active is True
+    assert agent._short_context_tools_disabled is True
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert agent._tool_use_enforcement is False
+    assert agent._compression_warning is not None
+    assert "Tool calling is disabled" in agent._compression_warning
+    assert "capabilities: completion" in agent._compression_warning
+
+
+def test_short_context_no_tools_uses_compact_system_prompt():
+    """Short-context completion-only sessions should skip the bulky default prompt."""
+
+    class _StubCompressor:
+        def __init__(self, *args, **kwargs):
+            self.context_length = 8_192
+            self.threshold_tokens = 64_000
+            self.threshold_percent = 0.50
+
+        def get_tool_schemas(self):
+            return []
+
+        def on_session_start(self, *args, **kwargs):
+            return None
+
+    cfg = {
+        "model": {
+            "short_context_mode": True,
+        },
+    }
+    fake_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "description": "memory tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=fake_tools),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("run_agent.ContextCompressor", new=_StubCompressor),
+        patch("run_agent.query_ollama_capabilities", return_value={"completion"}),
+        patch("run_agent.query_ollama_num_ctx", return_value=8_192),
+    ):
+        agent = AIAgent(
+            model="gemma2:2b",
+            api_key="test-key-1234567890",
+            base_url="http://ollama-local:11434/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            platform="whatsapp",
+        )
+
+    parts = agent._build_system_prompt_parts()
+
+    assert "constrained local runtime" in parts["stable"]
+    assert "Current runtime model: gemma2:2b" in parts["stable"]
+    assert "If the user writes in Spanish, respond in Spanish" in parts["stable"]
+    assert "WhatsApp chat: plain text only" in parts["stable"]
+    assert "no tool calling" in parts["stable"]
+    assert HERMES_AGENT_HELP_GUIDANCE not in parts["stable"]
+    assert PLATFORM_HINTS["whatsapp"] not in parts["stable"]
+    assert parts["context"] == ""
+    assert parts["volatile"] == ""
+
+
+def test_short_context_no_tools_prefers_non_streaming_for_local_endpoint():
+    """Degraded local short-context chat should bypass the streaming path."""
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._short_context_active = True
+    agent._short_context_tools_disabled = True
+    agent.base_url = "http://ollama-local:11434/v1"
+
+    assert agent._prefer_non_streaming_completion() is True
+
+    agent.base_url = "https://openrouter.ai/api/v1"
+    assert agent._prefer_non_streaming_completion() is False
 
 
 @patch("agent.auxiliary_client.get_text_auxiliary_client")

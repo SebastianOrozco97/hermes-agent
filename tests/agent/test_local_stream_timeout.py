@@ -94,6 +94,7 @@ class TestIsLocalEndpoint:
         "http://gateway.docker.internal:11434",
         "http://host.containers.internal:11434",
         "http://host.lima.internal:11434",
+        "http://ollama-local:11434/v1",
     ])
     def test_container_dns_names(self, url):
         assert is_local_endpoint(url) is True

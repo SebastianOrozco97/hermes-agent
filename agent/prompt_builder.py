@@ -411,6 +411,7 @@ DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
+        "Reply in the same language as the user's latest message; if the user writes in Spanish, respond in Spanish. "
         "Please do not use markdown as it does not render. "
         "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. The file "

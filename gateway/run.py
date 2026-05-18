@@ -14605,14 +14605,17 @@ class GatewayRunner:
                 and platform_key in _legacy_tp_overrides
             )
         )
+        from gateway.config import Platform
+        # Messaging users on WhatsApp should not see raw tool names by default.
+        # They can still explicitly re-enable tool progress in config if needed.
+        _default_progress_mode = "off" if source.platform == Platform.WHATSAPP else "all"
         progress_mode = (
             _env_tp
             if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
+            else (_resolved_tp or _env_tp or _default_progress_mode)
         )
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
-        from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
@@ -15042,8 +15045,24 @@ class GatewayRunner:
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        def _should_suppress_whatsapp_status(event_type: str, message: str) -> bool:
+            if source.platform != Platform.WHATSAPP or not isinstance(message, str):
+                return False
+            if event_type == "lifecycle" and "Short-context mode enabled" in message:
+                return True
+            return any(
+                fragment in message
+                for fragment in (
+                    "Model returned empty after tool calls",
+                    "Response truncated (finish_reason='length')",
+                    "Requesting continuation",
+                )
+            )
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
+                return
+            if _should_suppress_whatsapp_status(event_type, message):
                 return
             _fut = safe_schedule_threadsafe(
                 _status_adapter.send(

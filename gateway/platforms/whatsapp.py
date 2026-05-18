@@ -29,7 +29,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from hermes_constants import get_hermes_dir
+from hermes_constants import get_hermes_dir, resolve_whatsapp_bridge_script
 
 logger = logging.getLogger(__name__)
 
@@ -244,8 +244,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 4096
     DEFAULT_REPLY_PREFIX = "⚕ *Hermes Agent*\n────────────\n"
     
-    # Default bridge location relative to the hermes-agent install
-    _DEFAULT_BRIDGE_DIR = Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
+    # Default bridge location can live in the installed package tree or in a
+    # bind-mounted repository checkout inside Docker.
+    _DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_script().parent
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
@@ -631,14 +632,22 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 env=bridge_env,
             )
             _write_bridge_pidfile(self._session_path, self._bridge_process.pid)
+
+            try:
+                startup_timeout_s = max(
+                    5,
+                    int(os.environ.get("WHATSAPP_BRIDGE_STARTUP_TIMEOUT_S", "30")),
+                )
+            except ValueError:
+                startup_timeout_s = 30
             
             # Wait for the bridge to connect to WhatsApp.
-            # Phase 1: wait for the HTTP server to come up (up to 15s).
-            # Phase 2: wait for WhatsApp status: connected (up to 15s more).
+            # Phase 1: wait for the HTTP server to come up.
+            # Phase 2: wait for WhatsApp status: connected.
             import aiohttp
             http_ready = False
             data = {}
-            for attempt in range(15):
+            for attempt in range(startup_timeout_s):
                 await asyncio.sleep(1)
                 if self._bridge_process.poll() is not None:
                     print(f"[{self.name}] Bridge process died (exit code {self._bridge_process.returncode})")
@@ -661,7 +670,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     continue
 
             if not http_ready:
-                print(f"[{self.name}] Bridge HTTP server did not start in 15s")
+                print(f"[{self.name}] Bridge HTTP server did not start in {startup_timeout_s}s")
                 print(f"[{self.name}] Check log: {self._bridge_log}")
                 self._close_bridge_log()
                 return False
@@ -670,7 +679,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # Give it more time to authenticate with saved credentials.
             if data.get("status") != "connected":
                 print(f"[{self.name}] Bridge HTTP ready, waiting for WhatsApp connection...")
-                for attempt in range(15):
+                for attempt in range(startup_timeout_s):
                     await asyncio.sleep(1)
                     if self._bridge_process.poll() is not None:
                         print(f"[{self.name}] Bridge process died during connection")
@@ -693,7 +702,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 else:
                     # Still not connected — warn but proceed (bridge may
                     # auto-reconnect later, e.g. after a code 515 restart).
-                    print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
+                    print(f"[{self.name}] ⚠ WhatsApp not connected after {startup_timeout_s * 2}s")
                     print(f"[{self.name}]   Bridge log: {self._bridge_log}")
                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
             
