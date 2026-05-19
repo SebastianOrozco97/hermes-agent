@@ -413,6 +413,71 @@ def _daily_realized_pnl_usd(home: Optional[Path] = None) -> Decimal:
     return total
 
 
+def get_paper_daily_summary(summary_date: str = "", *, home: Optional[Path] = None) -> dict[str, Any]:
+    wanted_date = str(summary_date or "").strip() or _now_utc().date().isoformat()
+    state = _load_state(home=home)
+    events = _iter_jsonl(get_paper_journal_path(home=home))
+    entries: list[dict[str, Any]] = []
+    exits: list[dict[str, Any]] = []
+    approvals_requested = 0
+    approvals_approved = 0
+    approvals_denied = 0
+    realized_pnl_usd = Decimal("0")
+
+    for event in events:
+        if event.get("event_type") == "paper_position_opened" and str(event.get("opened_at", "")).startswith(wanted_date):
+            entries.append(
+                {
+                    "position_id": str(event.get("position_id", "") or "").strip(),
+                    "symbol": str(event.get("symbol", "") or "").strip().upper(),
+                    "side": str(event.get("side", "") or "").strip().upper(),
+                    "opened_at": str(event.get("opened_at", "") or "").strip(),
+                    "notional_usd": str(event.get("notional_usd", "0") or "0").strip(),
+                }
+            )
+            continue
+        if event.get("event_type") == "paper_position_closed" and str(event.get("closed_at", "")).startswith(wanted_date):
+            pnl = _parse_decimal(event.get("realized_pnl_usd", "0"), "realized_pnl_usd")
+            realized_pnl_usd += pnl
+            exits.append(
+                {
+                    "position_id": str(event.get("position_id", "") or "").strip(),
+                    "symbol": str(event.get("symbol", "") or "").strip().upper(),
+                    "side": str(event.get("side", "") or "").strip().upper(),
+                    "closed_at": str(event.get("closed_at", "") or "").strip(),
+                    "realized_pnl_usd": _decimal_to_str(pnl),
+                    "trigger": str(event.get("trigger", "") or "").strip(),
+                    "reason": str(event.get("reason", "") or "").strip(),
+                }
+            )
+            continue
+        if event.get("event_type") == "trade_approval_requested" and str(event.get("recorded_at", "")).startswith(wanted_date):
+            approvals_requested += 1
+            continue
+        if event.get("event_type") == "trade_approval_recorded" and str(event.get("recorded_at", "")).startswith(wanted_date):
+            status = str(event.get("status", "") or "").strip().lower()
+            if status == "approved":
+                approvals_approved += 1
+            elif status == "denied":
+                approvals_denied += 1
+
+    open_positions = [PaperPosition.from_payload(payload) for payload in state.get("open_positions", [])]
+    return {
+        "success": True,
+        "date": wanted_date,
+        "entries_count": len(entries),
+        "exits_count": len(exits),
+        "approvals_requested": approvals_requested,
+        "approvals_approved": approvals_approved,
+        "approvals_denied": approvals_denied,
+        "realized_pnl_usd": _decimal_to_str(realized_pnl_usd),
+        "open_positions_count": len(open_positions),
+        "open_positions": [position.to_dict() for position in open_positions],
+        "entries": entries,
+        "exits": exits,
+    }
+
+
 def seed_paper_account(
     starting_balance_usd: Optional[Decimal] = None,
     *,

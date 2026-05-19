@@ -5,6 +5,7 @@ from decimal import Decimal
 from tools.binance_guardrails import BinanceTradeProposal
 from tools.binance_paper_runtime import (
     close_paper_position,
+    get_paper_daily_summary,
     get_paper_account_overview,
     get_paper_position_status,
     open_paper_position,
@@ -189,3 +190,33 @@ def test_position_status_reports_open_and_closed_snapshots(tmp_path):
     assert closed_status["trigger"] == "take_profit"
     assert closed_status["realized_pnl_usd"] == closed["realized_pnl_usd"]
     assert closed_status["reason"] == "take profit reached"
+
+
+def test_daily_summary_reports_entries_exits_and_pnl(tmp_path):
+    seed_paper_account(Decimal("1000"), reset=True, home=tmp_path)
+    approval = request_trade_approval(_proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"), home=tmp_path)
+    record_trade_approval(approval["approval_id"], decision="approve", home=tmp_path)
+    opened = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id=approval["approval_id"],
+        home=tmp_path,
+    )
+    close_paper_position(
+        opened["position"]["position_id"],
+        exit_price=Decimal("0.105343"),
+        reason="manual take profit",
+        trigger="manual",
+        home=tmp_path,
+    )
+
+    summary = get_paper_daily_summary(home=tmp_path)
+
+    assert summary["success"] is True
+    assert summary["entries_count"] == 1
+    assert summary["exits_count"] == 1
+    assert summary["approvals_requested"] == 1
+    assert summary["approvals_approved"] == 1
+    assert summary["approvals_denied"] == 0
+    assert summary["open_positions_count"] == 0
+    assert summary["realized_pnl_usd"] == "0.2"

@@ -35,6 +35,7 @@ from tools.binance_guardrails import (
 from tools.binance_paper_runtime import (
     close_paper_position,
     consume_trade_approval,
+    get_paper_daily_summary,
     get_open_paper_position,
     get_paper_position_status,
     get_paper_account_overview,
@@ -114,6 +115,38 @@ def _decimal_text(value: Any, default: str = "0") -> str:
     if decimal_value == decimal_value.to_integral():
         return format(decimal_value.quantize(Decimal("1")), "f")
     return format(decimal_value.normalize(), "f")
+
+
+def _format_fixed_decimal(value: Any, places: int, default: str = "0") -> str:
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except Exception:
+        decimal_value = Decimal(default)
+    quantum = Decimal("1").scaleb(-places)
+    return format(decimal_value.quantize(quantum), f".{places}f")
+
+
+def _format_price_text(value: Any) -> str:
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except Exception:
+        decimal_value = Decimal("0")
+    absolute = abs(decimal_value)
+    if absolute >= Decimal("1000"):
+        places = 2
+    elif absolute >= Decimal("1"):
+        places = 4
+    else:
+        places = 6
+    return _format_fixed_decimal(decimal_value, places)
+
+
+def _format_usd_text(value: Any) -> str:
+    return _format_fixed_decimal(value, 2)
+
+
+def _format_pct_text(value: Any) -> str:
+    return _format_fixed_decimal(value, 2)
 
 
 def _operator_timestamp(value: str) -> str:
@@ -199,9 +232,9 @@ def _build_paper_entry_whatsapp_message(execution: dict[str, Any]) -> str:
     commands = execution.get("commands") or {}
     lines = [
         f"Paper ejecutado {position.get('side')} {position.get('symbol')} | {position.get('position_id')} | {position.get('approval_id') or 'sin approval id'}",
-        f"Fill: {_operator_timestamp(str(execution.get('filled_at', '') or position.get('opened_at', '') or ''))} a {_decimal_text(execution.get('fill_reference_price') or position.get('entry_price') or '0')}",
-        f"Notional {risk.get('notional_usd') or position.get('notional_usd') or '0'} USD | Riesgo max {risk.get('estimated_max_loss_usd') or 'n/d'} USD | R/B {risk.get('risk_reward_ratio') or 'n/d'}",
-        f"SL {risk.get('stop_loss_price') or position.get('stop_loss_price') or 'n/d'} | TP {risk.get('take_profit_price') or position.get('take_profit_price') or 'n/d'}",
+        f"Fill: {_operator_timestamp(str(execution.get('filled_at', '') or position.get('opened_at', '') or ''))} a {_format_price_text(execution.get('fill_reference_price') or position.get('entry_price') or '0')}",
+        f"Notional {_format_usd_text(risk.get('notional_usd') or position.get('notional_usd') or '0')} USD | Riesgo max {_format_usd_text(risk.get('estimated_max_loss_usd') or '0')} USD | R/B {risk.get('risk_reward_ratio') or 'n/d'}",
+        f"SL {_format_price_text(risk.get('stop_loss_price') or position.get('stop_loss_price') or '0')} | TP {_format_price_text(risk.get('take_profit_price') or position.get('take_profit_price') or '0')}",
     ]
     follow_up = _format_follow_up_line(commands)
     if follow_up:
@@ -213,13 +246,38 @@ def _build_paper_close_whatsapp_message(closed: dict[str, Any]) -> str:
     position = closed.get("position") or {}
     lines = [
         f"Paper cerrado {position.get('symbol')} {position.get('side')} | {position.get('position_id')}",
-        f"Salida: {_operator_timestamp(str(closed.get('closed_at', '') or ''))} a {_decimal_text(closed.get('exit_price') or '0')} | Trigger {_trigger_label(str(closed.get('trigger', '') or ''))}",
-        f"PnL {closed.get('realized_pnl_usd') or '0'} USD ({closed.get('realized_pnl_pct') or 'n/d'}%) | Duracion {closed.get('duration_human') or 'n/d'}",
+        f"Salida: {_operator_timestamp(str(closed.get('closed_at', '') or ''))} a {_format_price_text(closed.get('exit_price') or '0')} | Trigger {_trigger_label(str(closed.get('trigger', '') or ''))}",
+        f"PnL {_format_usd_text(closed.get('realized_pnl_usd') or '0')} USD ({_format_pct_text(closed.get('realized_pnl_pct') or '0')}%) | Duracion {closed.get('duration_human') or 'n/d'}",
         f"Motivo: {str(closed.get('reason', '') or '').strip() or 'n/d'}",
     ]
     follow_up = _format_follow_up_line(closed.get("commands") or {}, include_close=False)
     if follow_up:
         lines.append(follow_up)
+    return "\n".join(lines)
+
+
+def _build_paper_daily_summary_whatsapp_message(summary: dict[str, Any]) -> str:
+    open_positions = summary.get("open_positions") or []
+    lines = [
+        f"Resumen paper {summary.get('date') or 'n/d'}",
+        (
+            f"Entradas {summary.get('entries_count', 0)} | Salidas {summary.get('exits_count', 0)} | "
+            f"PnL realizado {_format_usd_text(summary.get('realized_pnl_usd') or '0')} USD"
+        ),
+        (
+            f"Aprobaciones pedidas {summary.get('approvals_requested', 0)} | "
+            f"Aprobadas {summary.get('approvals_approved', 0)} | Rechazadas {summary.get('approvals_denied', 0)}"
+        ),
+        f"Posiciones abiertas {summary.get('open_positions_count', 0)}",
+    ]
+    if open_positions:
+        preview = ", ".join(
+            f"{str(position.get('symbol', '') or '').strip().upper()} {str(position.get('side', '') or '').strip().upper()}"
+            for position in open_positions[:3]
+        )
+        if preview:
+            suffix = "..." if len(open_positions) > 3 else ""
+            lines.append(f"Abiertas: {preview}{suffix}")
     return "\n".join(lines)
 
 
@@ -428,7 +486,7 @@ def _submit_trade_result(
     approval_id: str = "",
     evidence_id: str = "",
     use_persistent_account: bool = True,
-    notify_whatsapp: bool = True,
+    notify_whatsapp: bool = False,
 ) -> dict[str, Any]:
     requested_live = str(mode).strip().lower() == "live" and not dry_run
     limits = BinanceRiskLimits.from_env()
@@ -508,6 +566,7 @@ def _submit_trade_result(
                 "decision": decision.to_dict(),
                 "paper_account": execution["account_snapshot"],
                 "paper_position": execution["position"],
+                "paper_execution": execution,
                 "approval": approval_record,
                 "whatsapp_notification": whatsapp_notification,
             }
@@ -789,7 +848,7 @@ def _build_server():
         market_summary: str = "",
         expires_minutes: int = 0,
         use_persistent_account: bool = True,
-        notify_whatsapp: bool = True,
+        notify_whatsapp: bool = False,
     ) -> str:
         """Create a formal trade approval request that the operator must approve from WhatsApp before entry."""
 
@@ -870,7 +929,7 @@ def _build_server():
         decision: str,
         response_text: str = "",
         responder: str = "operator",
-        notify_whatsapp: bool = True,
+        notify_whatsapp: bool = False,
     ) -> str:
         """Record the operator's WhatsApp approval or denial for a pending trade approval ID."""
 
@@ -922,7 +981,7 @@ def _build_server():
         approval_id: str = "",
         evidence_id: str = "",
         use_persistent_account: bool = True,
-        notify_whatsapp: bool = True,
+        notify_whatsapp: bool = False,
     ) -> str:
         """Submit a guarded paper preview or a live trade when explicitly armed."""
 
@@ -957,7 +1016,7 @@ def _build_server():
     def binance_close_paper_position(
         position_id: str,
         reason: str = "manual thesis invalidation",
-        notify_whatsapp: bool = True,
+        notify_whatsapp: bool = False,
     ) -> str:
         """Close an open paper position at the latest Binance reference price and journal the result."""
 

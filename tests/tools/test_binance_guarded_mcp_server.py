@@ -350,10 +350,31 @@ def test_build_paper_close_whatsapp_message_includes_pnl_reason_and_duration():
         }
     )
 
-    assert "PnL 0.2 USD (1%)" in message
+    assert "PnL 0.20 USD (1.00%)" in message
     assert "Motivo: protective exit triggered via take_profit" in message
     assert "Duracion 4m 10s" in message
     assert "Seguimiento: ESTADO TRADE-123" in message
+
+
+def test_build_paper_daily_summary_whatsapp_message_reports_daily_counts():
+    message = guarded._build_paper_daily_summary_whatsapp_message(
+        {
+            "date": "2026-05-19",
+            "entries_count": 2,
+            "exits_count": 1,
+            "realized_pnl_usd": "1.25",
+            "approvals_requested": 3,
+            "approvals_approved": 2,
+            "approvals_denied": 1,
+            "open_positions_count": 1,
+            "open_positions": [{"symbol": "DOGEUSDT", "side": "BUY"}],
+        }
+    )
+
+    assert "Resumen paper 2026-05-19" in message
+    assert "Entradas 2 | Salidas 1 | PnL realizado 1.25 USD" in message
+    assert "Aprobaciones pedidas 3 | Aprobadas 2 | Rechazadas 1" in message
+    assert "Abiertas: DOGEUSDT BUY" in message
 
 
 def test_runtime_env_reloads_when_env_file_changes(monkeypatch, tmp_path):
