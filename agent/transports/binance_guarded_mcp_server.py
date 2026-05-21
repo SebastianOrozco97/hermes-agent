@@ -46,6 +46,7 @@ from tools.binance_paper_runtime import (
     get_latest_trade_approval,
     get_trade_approval,
     open_paper_position,
+    record_live_trade_execution_failure,
     record_market_evidence,
     record_doge_premium_analysis_decision,
     record_trade_approval,
@@ -1486,11 +1487,23 @@ def _submit_trade_result(
     try:
         execution = executor.submit_trade(proposal)
     except BinanceLiveExecutionError as exc:
+        live_failure_event = record_live_trade_execution_failure(
+            proposal=proposal,
+            error=str(exc),
+            approval_id=approval_id,
+            stage="submit_trade",
+            rollback_sent="emergency rollback sent successfully" in str(exc).lower(),
+            details={
+                "evidence_id": str(evidence_id or "").strip() or None,
+                "mode": normalized_mode,
+            },
+        )
         return {
             "success": False,
             "error": str(exc),
             "decision": decision.to_dict(),
             "live_account_overview": overview,
+            "live_execution_failure": live_failure_event,
         }
 
     if approval_record is not None:

@@ -1163,11 +1163,13 @@ _RETRYABLE_ERROR_PATTERNS = (
     "connectionerror",
     "connectionreset",
     "connectionrefused",
+    "connection closed",
     "connecttimeout",
     "network",
     "broken pipe",
     "remotedisconnected",
     "eoferror",
+    "server disconnected",
 )
 
 

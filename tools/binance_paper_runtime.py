@@ -944,6 +944,31 @@ def request_trade_approval(
     return record
 
 
+def record_live_trade_execution_failure(
+    *,
+    proposal: BinanceTradeProposal,
+    error: str,
+    approval_id: str = "",
+    stage: str = "submit_trade",
+    rollback_sent: bool = False,
+    details: Optional[dict[str, Any]] = None,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    record = {
+        "event_type": "live_trade_execution_failed",
+        "recorded_at": _now_iso(),
+        "approval_id": str(approval_id or "").strip().upper() or None,
+        "symbol": proposal.symbol,
+        "proposal_fingerprint": _proposal_fingerprint(proposal),
+        "stage": str(stage or "submit_trade").strip() or "submit_trade",
+        "rollback_sent": bool(rollback_sent),
+        "error": str(error or "").strip() or "unknown live execution error",
+        "details": details or None,
+    }
+    _append_jsonl(get_paper_journal_path(home=home), record)
+    return record
+
+
 def record_trade_approval(
     approval_id: str,
     *,

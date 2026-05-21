@@ -10,11 +10,13 @@ from tools.binance_paper_runtime import (
     get_latest_doge_premium_analysis_request,
     get_paper_daily_summary,
     get_paper_account_overview,
+    get_paper_journal_path,
     get_latest_trade_approval,
     get_paper_position_status,
     open_paper_position,
     reconcile_protective_exits,
     record_doge_premium_analysis_decision,
+    record_live_trade_execution_failure,
     record_market_evidence,
     request_doge_premium_analysis,
     request_trade_approval,
@@ -220,6 +222,27 @@ def test_doge_premium_analysis_request_lifecycle_tracks_status_and_fingerprint(t
     assert completed["analysis_outcome"] == "passed"
     assert by_fingerprint is not None
     assert by_fingerprint["request_id"] == request["request_id"]
+
+
+def test_record_live_trade_execution_failure_appends_structured_journal_event(tmp_path):
+    record = record_live_trade_execution_failure(
+        proposal=_proposal(symbol="DOGEUSDT", mode="live", notional_usd="5.25"),
+        error="entry order executed but protective orders failed",
+        approval_id="TRADE-FAIL123",
+        rollback_sent=True,
+        details={"evidence_id": "EVID-123"},
+        home=tmp_path,
+    )
+
+    journal_lines = get_paper_journal_path(home=tmp_path).read_text(encoding="utf-8").splitlines()
+    payload = json.loads(journal_lines[-1])
+
+    assert record["event_type"] == "live_trade_execution_failed"
+    assert payload["event_type"] == "live_trade_execution_failed"
+    assert payload["approval_id"] == "TRADE-FAIL123"
+    assert payload["symbol"] == "DOGEUSDT"
+    assert payload["rollback_sent"] is True
+    assert payload["details"] == {"evidence_id": "EVID-123"}
 
 
 def test_reconcile_protective_exits_closes_take_profit_and_updates_balance(tmp_path):

@@ -101,6 +101,20 @@ class BinanceFuturesLiveExecutor:
             self._session.headers.update({"X-MBX-APIKEY": self.api_key})
         self._symbol_rules_cache: dict[str, SymbolTradingRules] = {}
 
+    def _protective_retry_attempts(self) -> int:
+        raw = os.getenv("BINANCE_FUTURES_PROTECTIVE_RETRY_ATTEMPTS", "3").strip() or "3"
+        try:
+            return max(1, min(int(raw), 6))
+        except ValueError:
+            return 3
+
+    def _protective_retry_delay_s(self) -> float:
+        raw = os.getenv("BINANCE_FUTURES_PROTECTIVE_RETRY_DELAY_S", "0.75").strip() or "0.75"
+        try:
+            return max(0.1, min(float(raw), 5.0))
+        except ValueError:
+            return 0.75
+
     @classmethod
     def from_env(cls, *, require_credentials: bool = True) -> "BinanceFuturesLiveExecutor":
         api_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -434,6 +448,36 @@ class BinanceFuturesLiveExecutor:
             return {"positionSide": self.position_side}
         return {}
 
+    def _get_open_position_snapshot(self, symbol: str) -> dict[str, Any]:
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise BinanceLiveExecutionError("symbol is required for position lookup")
+        body = self._request(
+            "GET",
+            "/fapi/v2/positionRisk",
+            params={"symbol": normalized_symbol},
+            signed=True,
+        )
+        positions = body if isinstance(body, list) else [body]
+        for row in positions:
+            if str(row.get("symbol", "") or "").strip().upper() != normalized_symbol:
+                continue
+            position_amt = _parse_decimal(row.get("positionAmt", "0"), field_name="positionAmt")
+            if position_amt == 0:
+                continue
+            return {
+                "symbol": normalized_symbol,
+                "position_amt": _format_decimal(position_amt),
+                "entry_price": str(row.get("entryPrice", "0")),
+                "side": "LONG" if position_amt > 0 else "SHORT",
+            }
+        return {
+            "symbol": normalized_symbol,
+            "position_amt": "0",
+            "entry_price": "0",
+            "side": "FLAT",
+        }
+
     def _place_protective_orders(
         self,
         *,
@@ -525,6 +569,44 @@ class BinanceFuturesLiveExecutor:
             take_profit_price=take_profit_price,
             rules=rules,
         )
+
+    def _arm_protective_orders_with_retry(
+        self,
+        proposal: BinanceTradeProposal,
+        *,
+        entry_price: Decimal,
+        rules: SymbolTradingRules,
+    ) -> dict[str, Any]:
+        attempts = self._protective_retry_attempts()
+        delay_s = self._protective_retry_delay_s()
+        errors: list[str] = []
+
+        for attempt in range(1, attempts + 1):
+            try:
+                protective_orders = self._arm_protective_orders(
+                    proposal,
+                    entry_price=entry_price,
+                    rules=rules,
+                )
+                protective_orders["attempts"] = attempt
+                return protective_orders
+            except Exception as exc:
+                position_note = "position lookup unavailable"
+                try:
+                    snapshot = self._get_open_position_snapshot(proposal.symbol)
+                    position_note = (
+                        f"position_amt={snapshot.get('position_amt', '0')}"
+                        f", side={snapshot.get('side', 'FLAT')}"
+                        f", entry_price={snapshot.get('entry_price', '0')}"
+                    )
+                except Exception as snapshot_exc:
+                    position_note = f"position lookup failed: {snapshot_exc}"
+                errors.append(f"attempt {attempt}/{attempts}: {exc} ({position_note})")
+                if attempt >= attempts:
+                    break
+                time.sleep(delay_s)
+
+        raise BinanceLiveExecutionError("; ".join(errors))
 
     def get_protective_orders(self, symbol: str, *, entry_side: str = "") -> dict[str, Any]:
         normalized_symbol = str(symbol).strip().upper()
@@ -705,7 +787,7 @@ class BinanceFuturesLiveExecutor:
         protective_orders = None
         rollback_result = None
         try:
-            protective_orders = self._arm_protective_orders(
+            protective_orders = self._arm_protective_orders_with_retry(
                 proposal,
                 entry_price=entry_price,
                 rules=rules,
@@ -719,7 +801,8 @@ class BinanceFuturesLiveExecutor:
                     f"{rollback_exc}. original protective-order error: {exc}"
                 ) from rollback_exc
             raise BinanceLiveExecutionError(
-                "entry order executed but protective orders failed; emergency rollback sent successfully"
+                "entry order executed but protective orders failed; emergency rollback sent successfully. "
+                f"original protective-order error: {exc}"
             ) from exc
 
         return {
