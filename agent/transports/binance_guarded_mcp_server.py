@@ -8,6 +8,7 @@ exchange adapter is added on top of this policy layer.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
@@ -34,19 +35,35 @@ from tools.binance_guardrails import (
 )
 from tools.binance_paper_runtime import (
     close_paper_position,
+    complete_doge_premium_analysis_request,
     consume_trade_approval,
+    get_doge_premium_analysis_request,
+    get_latest_doge_premium_analysis_request,
     get_paper_daily_summary,
     get_open_paper_position,
     get_paper_position_status,
     get_paper_account_overview,
+    get_latest_trade_approval,
     get_trade_approval,
     open_paper_position,
     record_market_evidence,
+    record_doge_premium_analysis_decision,
     record_trade_approval,
     reconcile_protective_exits,
     request_trade_approval,
     seed_paper_account,
     validate_trade_approval,
+)
+from tools.doge_live_manager import build_doge_live_management_snapshot
+from tools.doge_premium_flow import (
+    build_doge_adjustment_premium_payload,
+    material_fingerprint,
+    premium_request_kind_label,
+)
+from tools.doge_premium_gemini_verifier import (
+    DogePremiumGeminiVerifierError,
+    verify_doge_adjustment_with_premium_gemini,
+    verify_doge_entry_with_premium_gemini,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,13 +94,39 @@ def _ensure_runtime_env_loaded() -> None:
         return
 
     if env_path.exists():
-        override_existing = _LOADED_ENV_PATH == env_key and _LOADED_ENV_MTIME_NS is not None
         try:
-            load_dotenv(str(env_path), override=override_existing, encoding="utf-8")
+            load_dotenv(str(env_path), override=True, encoding="utf-8")
         except UnicodeDecodeError:
-            load_dotenv(str(env_path), override=override_existing, encoding="latin-1")
+            load_dotenv(str(env_path), override=True, encoding="latin-1")
     _LOADED_ENV_PATH = env_key
     _LOADED_ENV_MTIME_NS = env_mtime_ns
+
+
+def _resolve_requested_trade_mode(
+    mode: str,
+    *,
+    active_limits: Optional[BinanceRiskLimits] = None,
+) -> str:
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in {"", "auto"}:
+        return normalized_mode
+
+    limits = active_limits
+    if limits is None:
+        _ensure_runtime_env_loaded()
+        limits = BinanceRiskLimits.from_env()
+    return limits.mode
+
+
+def _resolve_effective_risk_limits(mode: str) -> tuple[str, BinanceRiskLimits, BinanceRiskLimits]:
+    _ensure_runtime_env_loaded()
+    active_limits = BinanceRiskLimits.from_env()
+    resolved_mode = _resolve_requested_trade_mode(mode, active_limits=active_limits)
+    if resolved_mode == active_limits.mode:
+        return resolved_mode, active_limits, active_limits
+    if resolved_mode == "paper":
+        return resolved_mode, replace(active_limits, mode="paper", live_trading_enabled=False), active_limits
+    return resolved_mode, active_limits, active_limits
 
 
 def _get_live_executor(*, require_credentials: bool = True) -> BinanceFuturesLiveExecutor:
@@ -162,6 +205,20 @@ def _operator_timestamp(value: str) -> str:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _operator_exchange_timestamp(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "n/d"
+    try:
+        milliseconds = int(text)
+    except ValueError:
+        return _operator_timestamp(text)
+    if milliseconds <= 0:
+        return "n/d"
+    parsed = datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
+    return parsed.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _proposal_risk_snapshot(notional_usd: float, stop_loss_pct: float, take_profit_pct: float) -> dict[str, Any]:
     notional = Decimal(str(notional_usd))
     stop_loss = Decimal(str(stop_loss_pct or 0))
@@ -214,16 +271,29 @@ def _build_paper_approval_whatsapp_message(
     notional_usd: float,
     stop_loss_pct: float,
     take_profit_pct: float,
+    expires_at: str = "",
+    symbol_shortcut: str = "",
 ) -> str:
     risk = _proposal_risk_snapshot(notional_usd, stop_loss_pct, take_profit_pct)
-    return "\n".join(
+    normalized_shortcut = str(symbol_shortcut or "").strip().upper()
+    lines = [
+        f"Aprobacion requerida {approval_id} | {side.upper()} {symbol.upper()}",
         (
-            f"Aprobacion requerida {approval_id}: {side.upper()} {symbol.upper()}.",
-            f"Notional {risk['notional_usd']} USD | Riesgo max {risk['estimated_max_loss_usd']} USD | R/B {risk.get('risk_reward_ratio') or 'n/d'}.",
-            f"Responde APROBAR {approval_id} o RECHAZAR {approval_id}.",
-            f"Seguimiento: ESTADO {approval_id}",
+            f"Notional {risk['notional_usd']} USD | Riesgo {_format_usd_text(risk['estimated_max_loss_usd'])} USD | "
+            f"SL {_format_pct_text(stop_loss_pct)}% | TP {_format_pct_text(take_profit_pct)}%"
+        ),
+    ]
+    expiry_label = _operator_timestamp(expires_at)
+    if expiry_label != "n/d":
+        lines.append(f"Expira {expiry_label}")
+    if normalized_shortcut:
+        lines.append(
+            f"Comandos: APROBAR {normalized_shortcut} | RECHAZAR {normalized_shortcut} | ESTADO {normalized_shortcut}"
         )
-    )
+        lines.append(f"Exacto: APROBAR {approval_id} | RECHAZAR {approval_id} | ESTADO {approval_id}")
+    else:
+        lines.append(f"Comandos: APROBAR {approval_id} | RECHAZAR {approval_id} | ESTADO {approval_id}")
+    return "\n".join(lines)
 
 
 def _build_paper_entry_whatsapp_message(execution: dict[str, Any]) -> str:
@@ -242,6 +312,493 @@ def _build_paper_entry_whatsapp_message(execution: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_live_entry_whatsapp_message(result: dict[str, Any]) -> str:
+    execution = result.get("execution") or {}
+    decision = result.get("decision") or {}
+    proposal = decision.get("proposal") or {}
+    approval = result.get("approval") or {}
+    entry_order = execution.get("entry_order") or {}
+    protective_orders = execution.get("protective_orders") or {}
+    approval_id = str(approval.get("approval_id") or "").strip() or "sin approval id"
+    symbol = str(proposal.get("symbol") or "").strip().upper()
+    symbol_shortcut = symbol.removesuffix("USDT") if symbol.endswith("USDT") else symbol
+    lines = [
+        f"Live ejecutado {proposal.get('side')} {proposal.get('symbol')} | {approval_id}",
+        (
+            f"Fill {_format_price_text(entry_order.get('avgPrice') or execution.get('entry_price') or execution.get('reference_price') or '0')}"
+            f" | Qty {_decimal_text(execution.get('quantity') or entry_order.get('executedQty') or '0')}"
+            f" | Estado {entry_order.get('status') or 'n/d'}"
+        ),
+        (
+            f"Notional {_format_usd_text(proposal.get('notional_usd') or '0')} USD | "
+            f"Lev {proposal.get('leverage') or '1'} | "
+            f"Hora {_operator_exchange_timestamp(entry_order.get('updateTime') or entry_order.get('transactTime') or entry_order.get('time') or '')}"
+        ),
+        (
+            f"SL {_format_price_text(protective_orders.get('stop_loss_price') or '0')} | "
+            f"TP {_format_price_text(protective_orders.get('take_profit_price') or '0')}"
+        ),
+        (
+            "Seguimiento: esperar radar 15m"
+            + (f" | AJUSTAR {symbol_shortcut} cuando Hermes lo pida" if symbol_shortcut else "")
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _symbol_shortcut(symbol: str) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if normalized.endswith("USDT"):
+        return normalized[:-4]
+    return normalized
+
+
+def _display_price_text(value: Any) -> str:
+    if str(value or "").strip() == "":
+        return "n/d"
+    return _format_price_text(value)
+
+
+def _premium_model_display_name(model: str) -> str:
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("gemini-3.5-flash"):
+        return "Gemini 3.5 Flash"
+    return str(model or "Gemini premium").strip() or "Gemini premium"
+
+
+def _doge_premium_analysis_enabled() -> bool:
+    _ensure_runtime_env_loaded()
+    return _parse_bool(os.getenv("DOGE_PREMIUM_ANALYSIS_ENABLED"), default=True)
+
+
+def _doge_premium_analysis_model() -> str:
+    _ensure_runtime_env_loaded()
+    return str(os.getenv("DOGE_PREMIUM_ANALYSIS_MODEL", "gemini-3.5-flash") or "").strip() or "gemini-3.5-flash"
+
+
+def _doge_premium_analysis_timeout_sec() -> float:
+    _ensure_runtime_env_loaded()
+    raw = str(os.getenv("DOGE_PREMIUM_ANALYSIS_TIMEOUT_SEC", "90") or "90").strip() or "90"
+    try:
+        return max(30.0, float(raw))
+    except ValueError:
+        return 90.0
+
+
+def _build_doge_premium_request_whatsapp_message(request: dict[str, Any]) -> str:
+    material_payload = request.get("material_payload") or {}
+    request_kind = str(request.get("request_kind") or "").strip().lower()
+    symbol = str(request.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+    kind_label = premium_request_kind_label(request_kind)
+    model_label = _premium_model_display_name(str(request.get("model") or ""))
+    lines = [f"Analisis premium pendiente {symbol} | {kind_label} | {model_label}"]
+    if request_kind == "entry":
+        base_summary = str(request.get("material_summary") or material_payload.get("market_summary") or "").strip()
+        if base_summary:
+            lines.append(f"Base: {base_summary}")
+    elif request_kind == "adjustment":
+        adjustment_context = material_payload.get("adjustment_context") or {}
+        lines.append(f"Base: {adjustment_context.get('summary') or request.get('material_summary') or 'ajuste accionable'}")
+        if adjustment_context.get("high_risk"):
+            lines.append(
+                "Riesgo: ALTO RIESGO. " + str(adjustment_context.get("high_risk_reason") or "amplia el riesgo real")
+            )
+    expiry_label = _operator_timestamp(str(request.get("expires_at") or ""))
+    if expiry_label != "n/d":
+        lines.append(f"Expira {expiry_label}")
+    lines.append("Comandos: ANALIZAR DOGE | RECHAZAR ANALISIS DOGE | ESTADO DOGE")
+    return "\n".join(lines)
+
+
+def _build_doge_adjustment_ready_message(
+    material_payload: dict[str, Any],
+    *,
+    intro: str = "",
+    premium_assessment: Optional[dict[str, Any]] = None,
+) -> str:
+    adjustment_context = material_payload.get("adjustment_context") or {}
+    position = material_payload.get("position") or {}
+    lines: list[str] = []
+    if intro:
+        lines.append(intro)
+    lines.append(
+        f"DOGE ajuste listo | {str(position.get('approval_id') or 'sin approval id').strip().upper() or 'sin approval id'}"
+    )
+    lines.append(
+        (
+            f"Mercado {_format_price_text(position.get('market_price') or '0')} | "
+            f"PnL {_format_usd_text(adjustment_context.get('unrealized_pnl_usd') or '0')} USD "
+            f"({_format_pct_text(adjustment_context.get('unrealized_pnl_pct') or '0')}%)"
+        )
+    )
+    lines.append(
+        (
+            f"SL {_display_price_text(adjustment_context.get('current_stop_price'))} -> {_display_price_text(adjustment_context.get('suggested_stop_price'))} | "
+            f"TP {_display_price_text(adjustment_context.get('current_take_profit_price'))} -> {_display_price_text(adjustment_context.get('suggested_take_profit_price'))}"
+        )
+    )
+    lines.append(f"Plan: {adjustment_context.get('summary') or 'ajuste accionable'}")
+    if adjustment_context.get("high_risk"):
+        lines.append(
+            "Riesgo: ALTO RIESGO. " + str(adjustment_context.get("high_risk_reason") or "amplia el riesgo real")
+        )
+    if premium_assessment:
+        risk_flags = premium_assessment.get("risk_flags") or []
+        lines.append(
+            f"Gemini 3.5 Flash: {premium_assessment.get('summary') or 'confirma el ajuste'} | Conf {_format_pct_text(Decimal(str(premium_assessment.get('confidence') or '0')) * Decimal('100'))}%"
+        )
+        if premium_assessment.get("suggested_stop_price") or premium_assessment.get("suggested_take_profit_price"):
+            lines.append(
+                (
+                    f"Premium sugiere: SL {_display_price_text(premium_assessment.get('suggested_stop_price'))} | "
+                    f"TP {_display_price_text(premium_assessment.get('suggested_take_profit_price'))}"
+                )
+            )
+        if premium_assessment.get("risk_label") == "alto_riesgo":
+            lines.append("Etiqueta premium: ALTO RIESGO")
+        if risk_flags:
+            lines.append("Riesgos: " + ", ".join(str(item) for item in risk_flags))
+    lines.append("Seguimiento: AJUSTAR DOGE")
+    return "\n".join(lines)
+
+
+def _proposal_payload_matches(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    keys = (
+        "symbol",
+        "side",
+        "mode",
+        "order_type",
+        "notional_usd",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "leverage",
+        "verifier_model",
+    )
+    return all(str(left.get(key) or "") == str(right.get(key) or "") for key in keys)
+
+
+def _ensure_trade_approval_from_premium_request(
+    request: dict[str, Any],
+    *,
+    requested_via: str,
+) -> dict[str, Any]:
+    material_payload = request.get("material_payload") or {}
+    proposal_payload = material_payload.get("proposal_payload") or {}
+    proposal = BinanceTradeProposal.from_payload(proposal_payload)
+    pending_approval = get_latest_trade_approval(symbol=proposal.symbol, status="pending")
+    if pending_approval is not None and _proposal_payload_matches(pending_approval.get("proposal") or {}, proposal.to_dict()):
+        return pending_approval
+    return request_trade_approval(
+        proposal,
+        evidence_id=str(material_payload.get("evidence_id") or ""),
+        market_summary=str(material_payload.get("market_summary") or ""),
+        requested_via=requested_via,
+    )
+
+
+def _execute_doge_premium_analysis(request: dict[str, Any]) -> dict[str, Any]:
+    material_payload = request.get("material_payload") or {}
+    request_kind = str(request.get("request_kind") or "").strip().lower()
+    model = str(request.get("model") or _doge_premium_analysis_model()).strip() or _doge_premium_analysis_model()
+    timeout = _doge_premium_analysis_timeout_sec()
+    if request_kind == "entry":
+        assessment = verify_doge_entry_with_premium_gemini(
+            payload=material_payload,
+            model=model,
+            timeout=timeout,
+        )
+    elif request_kind == "adjustment":
+        assessment = verify_doge_adjustment_with_premium_gemini(
+            payload=material_payload,
+            model=model,
+            timeout=timeout,
+        )
+    else:
+        raise ValueError(f"unsupported premium request kind: {request_kind}")
+    return assessment.to_dict()
+
+
+def _resolve_doge_premium_analysis_request(
+    *,
+    symbol: str,
+    decision: str,
+) -> dict[str, Any]:
+    _ensure_runtime_env_loaded()
+    normalized_symbol = str(symbol or "").strip().upper()
+    pending_request = get_latest_doge_premium_analysis_request(symbol=normalized_symbol, status="pending")
+    if pending_request is None:
+        latest_request = get_latest_doge_premium_analysis_request(symbol=normalized_symbol)
+        return {
+            "success": False,
+            "error": f"No hay un analisis premium pendiente para {normalized_symbol}.",
+            "reason_code": "no_pending_request",
+            "request": latest_request,
+            "symbol": normalized_symbol,
+        }
+
+    resolved_request = record_doge_premium_analysis_decision(
+        str(pending_request.get("request_id") or ""),
+        decision=decision,
+        response_text=f"Premium decision via WhatsApp DM: {decision}",
+        responder="operator",
+    )
+    request_kind = str(resolved_request.get("request_kind") or "").strip().lower()
+
+    if str(decision or "").strip().lower() in {"deny", "denied", "reject", "rejected", "cancel", "canceled", "no", "n"}:
+        result = {
+            "success": True,
+            "premium_outcome": "denied_fallback",
+            "request": resolved_request,
+            "symbol": normalized_symbol,
+        }
+        if request_kind == "entry":
+            result["trade_approval"] = _ensure_trade_approval_from_premium_request(
+                resolved_request,
+                requested_via="doge_premium_denied_fallback",
+            )
+        return result
+
+    try:
+        assessment = _execute_doge_premium_analysis(resolved_request)
+    except DogePremiumGeminiVerifierError as exc:
+        completed_request = complete_doge_premium_analysis_request(
+            str(resolved_request.get("request_id") or ""),
+            analysis_outcome="error",
+            response_text=str(exc),
+            responder="system",
+        )
+        result = {
+            "success": True,
+            "premium_outcome": "error_fallback",
+            "error": str(exc),
+            "request": completed_request,
+            "symbol": normalized_symbol,
+        }
+        if completed_request.get("fallback_allowed") and request_kind == "entry":
+            result["trade_approval"] = _ensure_trade_approval_from_premium_request(
+                completed_request,
+                requested_via="doge_premium_error_fallback",
+            )
+        return result
+
+    premium_outcome = "passed" if assessment.get("passed") else "rejected"
+    completed_request = complete_doge_premium_analysis_request(
+        str(resolved_request.get("request_id") or ""),
+        analysis_outcome=premium_outcome,
+        analysis=assessment,
+        response_text=assessment.get("summary") or "",
+        responder="system",
+    )
+    result = {
+        "success": True,
+        "premium_outcome": premium_outcome,
+        "assessment": assessment,
+        "request": completed_request,
+        "symbol": normalized_symbol,
+    }
+    if premium_outcome == "passed" and request_kind == "entry":
+        result["trade_approval"] = _ensure_trade_approval_from_premium_request(
+            completed_request,
+            requested_via="doge_premium_passed",
+        )
+    return result
+
+
+def _build_doge_premium_resolution_whatsapp_message(result: dict[str, Any]) -> str:
+    request = result.get("request") or {}
+    request_kind = str(request.get("request_kind") or "").strip().lower()
+    request_model = _premium_model_display_name(str(request.get("model") or ""))
+    assessment = result.get("assessment") or {}
+    outcome = str(result.get("premium_outcome") or "").strip().lower()
+    symbol = str(request.get("symbol") or result.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+
+    if outcome in {"denied_fallback", "error_fallback"}:
+        intro = "Analisis premium omitido; vuelvo al flujo actual con Gemini 3.1 Flash Lite."
+        if outcome == "error_fallback":
+            intro = (
+                f"{request_model} no estuvo disponible; vuelvo al flujo actual con Gemini 3.1 Flash Lite."
+            )
+        if request_kind == "entry":
+            approval = result.get("trade_approval") or {}
+            proposal = approval.get("proposal") or {}
+            body = _build_paper_approval_whatsapp_message(
+                approval_id=str(approval.get("approval_id") or ""),
+                symbol=str(proposal.get("symbol") or symbol),
+                side=str(proposal.get("side") or "BUY"),
+                notional_usd=float(proposal.get("notional_usd") or 0.0),
+                stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
+                take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
+                expires_at=str(approval.get("expires_at") or ""),
+                symbol_shortcut=_symbol_shortcut(str(proposal.get("symbol") or symbol)),
+            )
+            return intro + "\n" + body
+        return _build_doge_adjustment_ready_message(
+            request.get("material_payload") or {},
+            intro=intro,
+        )
+
+    if outcome == "passed":
+        if request_kind == "entry":
+            approval = result.get("trade_approval") or {}
+            proposal = approval.get("proposal") or {}
+            intro_lines = [
+                f"{request_model} confirma entrada {symbol} | Conf {_format_pct_text(Decimal(str(assessment.get('confidence') or '0')) * Decimal('100'))}%",
+                f"Resumen: {assessment.get('summary') or 'setup valido'}",
+            ]
+            risk_flags = assessment.get("risk_flags") or []
+            if assessment.get("suggested_stop_price") or assessment.get("suggested_take_profit_price"):
+                intro_lines.append(
+                    (
+                        f"Premium sugiere: SL {_display_price_text(assessment.get('suggested_stop_price'))} | "
+                        f"TP {_display_price_text(assessment.get('suggested_take_profit_price'))}"
+                    )
+                )
+            if risk_flags:
+                intro_lines.append("Riesgos: " + ", ".join(str(item) for item in risk_flags))
+            intro_lines.append(f"Operador: {assessment.get('operator_note') or 'n/d'}")
+            body = _build_paper_approval_whatsapp_message(
+                approval_id=str(approval.get("approval_id") or ""),
+                symbol=str(proposal.get("symbol") or symbol),
+                side=str(proposal.get("side") or "BUY"),
+                notional_usd=float(proposal.get("notional_usd") or 0.0),
+                stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
+                take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
+                expires_at=str(approval.get("expires_at") or ""),
+                symbol_shortcut=_symbol_shortcut(str(proposal.get("symbol") or symbol)),
+            )
+            return "\n".join(intro_lines + [body])
+        intro = f"{request_model} valida el ajuste DOGE | Conf {_format_pct_text(Decimal(str(assessment.get('confidence') or '0')) * Decimal('100'))}%"
+        return _build_doge_adjustment_ready_message(
+            request.get("material_payload") or {},
+            intro=intro,
+            premium_assessment=assessment,
+        )
+
+    if outcome == "rejected":
+        lines = [
+            f"{request_model} descarta {premium_request_kind_label(request_kind)} {symbol}.",
+            f"Resumen: {assessment.get('summary') or 'n/d'}",
+        ]
+        risk_flags = assessment.get("risk_flags") or []
+        if risk_flags:
+            lines.append("Riesgos: " + ", ".join(str(item) for item in risk_flags))
+        lines.append(f"Operador: {assessment.get('operator_note') or 'n/d'}")
+        lines.append("Seguimiento: esperar siguiente radar 15m")
+        return "\n".join(lines)
+
+    return result.get("error") or f"No hay un resultado premium accionable para {symbol}."
+
+
+def _build_doge_premium_status_whatsapp_message(request: dict[str, Any]) -> str:
+    status = str(request.get("status") or "").strip().lower()
+    if status == "pending":
+        return _build_doge_premium_request_whatsapp_message(request)
+    if status == "completed":
+        return _build_doge_premium_resolution_whatsapp_message(
+            {
+                "premium_outcome": str(request.get("analysis_outcome") or "").strip().lower(),
+                "request": request,
+                "assessment": request.get("analysis") or {},
+                "symbol": request.get("symbol"),
+            }
+        )
+    label = {
+        "approved": "aprobado y en proceso",
+        "denied": "omitido por operador",
+        "expired": "expirado",
+    }.get(status, status or "desconocido")
+    return (
+        f"Analisis premium {str(request.get('symbol') or 'DOGEUSDT').strip().upper()} {label}.\n"
+        "Seguimiento: ESTADO DOGE"
+    )
+
+
+def _management_result_payload(snapshot: Any) -> dict[str, Any]:
+    return {
+        "symbol": snapshot.symbol,
+        "approval_id": snapshot.approval_id,
+        "entry_side": snapshot.entry_side,
+        "action": snapshot.plan.action,
+        "summary": snapshot.plan.summary,
+        "rationale": snapshot.plan.rationale,
+        "market_price": _decimal_text(getattr(snapshot.signal, "last_close", "0")),
+        "entry_price": _decimal_text(snapshot.active_position.get("entry_price") or "0"),
+        "unrealized_pnl_usd": _decimal_text(snapshot.plan.unrealized_pnl_usd),
+        "unrealized_pnl_pct": _decimal_text(snapshot.plan.pnl_pct),
+        "current_stop_price": (
+            _decimal_text(snapshot.protective_orders.get("stop_loss_price"))
+            if snapshot.protective_orders.get("stop_loss")
+            else ""
+        ),
+        "current_take_profit_price": (
+            _decimal_text(snapshot.protective_orders.get("take_profit_price"))
+            if snapshot.protective_orders.get("take_profit")
+            else ""
+        ),
+        "recommended_stop_price": _decimal_text(snapshot.recommended_stop_price),
+        "recommended_take_profit_price": _decimal_text(snapshot.recommended_take_profit_price),
+        "protective_orders_missing": snapshot.protective_orders_missing,
+        "higher_timeframe_support": snapshot.plan.higher_timeframe_support,
+        "higher_timeframe_total": snapshot.plan.higher_timeframe_total,
+        "position_side": str(snapshot.active_position.get("side") or "LONG").strip().upper(),
+    }
+
+
+def _build_live_adjustment_whatsapp_message(result: dict[str, Any]) -> str:
+    management = result.get("management") or {}
+    premium_assessment = result.get("premium_assessment") or {}
+    symbol = str(management.get("symbol") or result.get("symbol") or "").strip().upper() or "n/d"
+    approval_id = str(management.get("approval_id") or "").strip().upper() or "sin approval id"
+    symbol_shortcut = _symbol_shortcut(symbol)
+    lines = [
+        f"Ajuste live {symbol} | {approval_id}",
+        (
+            f"Mercado {_format_price_text(management.get('market_price') or '0')} | "
+            f"PnL {_format_usd_text(management.get('unrealized_pnl_usd') or '0')} USD "
+            f"({_format_pct_text(management.get('unrealized_pnl_pct') or '0')}%)"
+        ),
+        (
+            f"SL {_display_price_text(management.get('current_stop_price'))} -> {_display_price_text(management.get('recommended_stop_price'))} | "
+            f"TP {_display_price_text(management.get('current_take_profit_price'))} -> {_display_price_text(management.get('recommended_take_profit_price'))}"
+        ),
+        f"Plan: {management.get('summary') or 'ajuste ejecutado'}",
+        "Seguimiento: esperar radar 15m",
+    ]
+    if str(premium_assessment.get("risk_label") or "").strip().lower() == "alto_riesgo":
+        lines.insert(4, "Etiqueta premium: ALTO RIESGO")
+    return "\n".join(lines)
+
+
+def _build_live_adjustment_status_whatsapp_message(result: dict[str, Any]) -> str:
+    management = result.get("management") or {}
+    symbol = str(management.get("symbol") or result.get("symbol") or "").strip().upper() or "n/d"
+    approval_id = str(management.get("approval_id") or "").strip().upper()
+    symbol_shortcut = _symbol_shortcut(symbol)
+    header = result.get("error") or "No hay ajuste live accionable en este momento."
+    if approval_id:
+        header = f"{header}\n{symbol} | {approval_id}"
+    else:
+        header = f"{header}\n{symbol}"
+    lines = [header]
+    if management:
+        lines.append(
+            (
+                f"Mercado {_format_price_text(management.get('market_price') or '0')} | "
+                f"SL {_display_price_text(management.get('current_stop_price'))} | "
+                f"TP {_display_price_text(management.get('current_take_profit_price'))}"
+            )
+        )
+        lines.append(f"Plan: {management.get('summary') or 'sin cambios'}")
+    follow_up = []
+    if symbol_shortcut:
+        follow_up.append("esperar radar 15m")
+        if result.get("reason_code") == "no_change":
+            follow_up.append(f"AJUSTAR {symbol_shortcut} solo cuando Hermes lo pida")
+    if follow_up:
+        lines.append("Seguimiento: " + " | ".join(follow_up))
+    return "\n".join(lines)
+
+
 def _build_paper_close_whatsapp_message(closed: dict[str, Any]) -> str:
     position = closed.get("position") or {}
     lines = [
@@ -254,6 +811,96 @@ def _build_paper_close_whatsapp_message(closed: dict[str, Any]) -> str:
     if follow_up:
         lines.append(follow_up)
     return "\n".join(lines)
+
+
+def _build_paper_status_whatsapp_message(status: dict[str, Any]) -> str:
+    normalized_status = str(status.get("status", "") or "").strip().lower()
+    if normalized_status == "closed":
+        return _build_paper_close_whatsapp_message(status)
+
+    if normalized_status == "open":
+        position = status.get("position") or {}
+        risk = status.get("risk") or {}
+        commands = status.get("commands") or {}
+        lines = [
+            f"Paper activo {position.get('symbol')} {position.get('side')} | {position.get('position_id')} | {position.get('approval_id') or 'sin approval id'}",
+            f"Entrada: {_operator_timestamp(str(status.get('opened_at', '') or position.get('opened_at', '') or ''))} a {_format_price_text(position.get('entry_price') or '0')}",
+        ]
+        pnl_line = f"PnL flotante {_format_usd_text(status.get('unrealized_pnl_usd') or '0')} USD"
+        unrealized_pct = status.get("unrealized_pnl_pct")
+        if unrealized_pct is not None:
+            pnl_line += f" ({_format_pct_text(unrealized_pct)}%)"
+        market_price = status.get("market_price")
+        if market_price is not None:
+            pnl_line = f"Mercado {_format_price_text(market_price)} | {pnl_line}"
+        pnl_line += f" | Duracion {status.get('duration_human') or 'n/d'}"
+        lines.append(pnl_line)
+        lines.append(
+            f"Notional {_format_usd_text(risk.get('notional_usd') or position.get('notional_usd') or '0')} USD | Riesgo max {_format_usd_text(risk.get('estimated_max_loss_usd') or '0')} USD | R/B {risk.get('risk_reward_ratio') or 'n/d'}"
+        )
+        lines.append(
+            f"SL {_format_price_text(risk.get('stop_loss_price') or position.get('stop_loss_price') or '0')} | TP {_format_price_text(risk.get('take_profit_price') or position.get('take_profit_price') or '0')}"
+        )
+        follow_up = _format_follow_up_line(commands)
+        if follow_up:
+            lines.append(follow_up)
+        return "\n".join(lines)
+
+    if normalized_status.startswith("approval_"):
+        approval = status.get("approval") or {}
+        proposal = approval.get("proposal") or {}
+        commands = status.get("commands") or {}
+        approval_id = str(approval.get("approval_id") or "").strip() or "n/d"
+        approval_state = str(approval.get("status") or normalized_status.removeprefix("approval_") or "unknown").strip().lower()
+        label = {
+            "pending": "pendiente",
+            "approved": "aprobada",
+            "denied": "rechazada",
+            "expired": "expirada",
+        }.get(approval_state, approval_state or "desconocida")
+        lines = [
+            f"Aprobacion {approval_id} {label}",
+            (
+                f"{str(proposal.get('side', '') or '').strip().upper()} "
+                f"{str(proposal.get('symbol', '') or '').strip().upper()} | "
+                f"Notional {_format_usd_text(proposal.get('notional_usd') or '0')} USD | "
+                f"SL {proposal.get('stop_loss_pct') or '0'}% | TP {proposal.get('take_profit_pct') or '0'}%"
+            ).strip(),
+        ]
+        created_at = _operator_timestamp(str(approval.get("created_at", "") or ""))
+        expires_at = _operator_timestamp(str(approval.get("expires_at", "") or ""))
+        if created_at != "n/d" or expires_at != "n/d":
+            lines.append(f"Creada {created_at} | Expira {expires_at}")
+        market_summary = str(approval.get("market_summary", "") or "").strip()
+        if market_summary:
+            lines.append(f"Tesis: {market_summary}")
+        follow_up_parts: list[str] = []
+        status_trade = str(commands.get("status_trade", "") or "").strip()
+        status_symbol = str(commands.get("status_symbol", "") or "").strip()
+        approve_trade = str(commands.get("approve_trade", "") or "").strip()
+        approve_symbol = str(commands.get("approve_symbol", "") or "").strip()
+        reject_trade = str(commands.get("reject_trade", "") or "").strip()
+        reject_symbol = str(commands.get("reject_symbol", "") or "").strip()
+        if status_trade:
+            follow_up_parts.append(status_trade)
+        if status_symbol and status_symbol not in follow_up_parts:
+            follow_up_parts.append(status_symbol)
+        if approval_state == "pending" and approve_trade:
+            follow_up_parts.append(approve_trade)
+        if approval_state == "pending" and approve_symbol and approve_symbol not in follow_up_parts:
+            follow_up_parts.append(approve_symbol)
+        if approval_state == "pending" and reject_trade:
+            follow_up_parts.append(reject_trade)
+        if approval_state == "pending" and reject_symbol and reject_symbol not in follow_up_parts:
+            follow_up_parts.append(reject_symbol)
+        if follow_up_parts:
+            lines.append("Seguimiento: " + " | ".join(follow_up_parts))
+        return "\n".join(lines)
+
+    reference = str((status.get("commands") or {}).get("status_trade") or (status.get("commands") or {}).get("status_position") or "").replace("ESTADO ", "").strip()
+    if reference:
+        return f"Estado paper {reference}: {normalized_status or 'desconocido'}."
+    return f"Estado paper: {normalized_status or 'desconocido'}."
 
 
 def _build_paper_daily_summary_whatsapp_message(summary: dict[str, Any]) -> str:
@@ -402,6 +1049,173 @@ def _account_snapshot_result(symbol: str = "") -> dict[str, Any]:
     }
 
 
+def _adjust_live_trade_protection_result(
+    *,
+    symbol: str,
+    timeframe: str = "15m",
+    score_threshold: int = 5,
+    context_timeframes: tuple[str, ...] = ("1h", "4h"),
+    default_stop_loss_pct: Decimal = Decimal("0.5"),
+    default_take_profit_pct: Decimal = Decimal("1.0"),
+    notify_whatsapp: bool = False,
+) -> dict[str, Any]:
+    _ensure_runtime_env_loaded()
+    limits = BinanceRiskLimits.from_env()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return {"success": False, "error": "symbol is required", "reason_code": "invalid_symbol"}
+    if limits.mode != "live" or not limits.live_trading_enabled:
+        return {
+            "success": False,
+            "error": "Live no esta armado para ajustes reales.",
+            "reason_code": "live_disabled",
+            "symbol": normalized_symbol,
+        }
+    if limits.allowed_symbols and normalized_symbol not in limits.allowed_symbols:
+        return {
+            "success": False,
+            "error": f"{normalized_symbol} no esta permitido por la politica activa.",
+            "reason_code": "symbol_not_allowed",
+            "symbol": normalized_symbol,
+        }
+
+    try:
+        executor = _get_live_executor(require_credentials=True)
+        snapshot = build_doge_live_management_snapshot(
+            executor,
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            score_threshold=score_threshold,
+            context_timeframes=context_timeframes,
+            default_stop_loss_pct=default_stop_loss_pct,
+            default_take_profit_pct=default_take_profit_pct,
+        )
+    except BinanceLiveExecutionError as exc:
+        return {"success": False, "error": str(exc), "reason_code": "exchange_error", "symbol": normalized_symbol}
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "reason_code": "management_error", "symbol": normalized_symbol}
+
+    if snapshot is None:
+        return {
+            "success": False,
+            "error": f"No hay una posicion live abierta en {normalized_symbol} para ajustar.",
+            "reason_code": "no_position",
+            "symbol": normalized_symbol,
+        }
+
+    management = _management_result_payload(snapshot)
+    material_payload = build_doge_adjustment_premium_payload(snapshot, timeframe=timeframe)
+    current_fingerprint = material_fingerprint(material_payload)
+    premium_request = get_latest_doge_premium_analysis_request(
+        symbol=normalized_symbol,
+        request_kind="adjustment",
+    )
+    if premium_request is not None and str(premium_request.get("event_fingerprint") or "").strip().upper() == current_fingerprint:
+        premium_status = str(premium_request.get("status") or "").strip().lower()
+        premium_outcome = str(premium_request.get("analysis_outcome") or "").strip().lower()
+        if premium_status == "pending":
+            return {
+                "success": False,
+                "error": "Hay un analisis premium pendiente para este ajuste DOGE.",
+                "reason_code": "premium_pending",
+                "symbol": normalized_symbol,
+                "management": management,
+                "premium_request": premium_request,
+            }
+        if premium_status == "completed" and premium_outcome == "rejected":
+            return {
+                "success": False,
+                "error": "Gemini 3.5 Flash descarto este ajuste para el evento actual.",
+                "reason_code": "premium_rejected",
+                "symbol": normalized_symbol,
+                "management": management,
+                "premium_request": premium_request,
+            }
+
+    effective_stop_price = snapshot.recommended_stop_price
+    effective_take_profit_price = snapshot.recommended_take_profit_price
+    premium_assessment = {}
+    if premium_request is not None and str(premium_request.get("analysis_outcome") or "").strip().lower() == "passed":
+        premium_assessment = premium_request.get("analysis") or {}
+        rules = executor._get_symbol_rules(normalized_symbol)
+        suggested_stop_price = str(premium_assessment.get("suggested_stop_price") or "").strip()
+        suggested_take_profit_price = str(premium_assessment.get("suggested_take_profit_price") or "").strip()
+        if suggested_stop_price:
+            try:
+                effective_stop_price = executor.normalize_protective_price(
+                    symbol=normalized_symbol,
+                    entry_side=snapshot.entry_side,
+                    purpose="stop_loss",
+                    price=Decimal(suggested_stop_price),
+                    rules=rules,
+                )
+            except Exception:
+                effective_stop_price = snapshot.recommended_stop_price
+        if suggested_take_profit_price:
+            try:
+                effective_take_profit_price = executor.normalize_protective_price(
+                    symbol=normalized_symbol,
+                    entry_side=snapshot.entry_side,
+                    purpose="take_profit",
+                    price=Decimal(suggested_take_profit_price),
+                    rules=rules,
+                )
+            except Exception:
+                effective_take_profit_price = snapshot.recommended_take_profit_price
+        management["recommended_stop_price"] = _decimal_text(effective_stop_price)
+        management["recommended_take_profit_price"] = _decimal_text(effective_take_profit_price)
+
+    if snapshot.plan.action == "exit_defensive":
+        return {
+            "success": False,
+            "error": "La lectura actual pide revisar salida defensiva, no mover SL/TP.",
+            "reason_code": "defensive_exit",
+            "symbol": normalized_symbol,
+            "management": management,
+        }
+    if not snapshot.actionable_adjustment:
+        return {
+            "success": False,
+            "error": "DOGE no necesita ajuste live ahora; la proteccion ya esta alineada.",
+            "reason_code": "no_change",
+            "symbol": normalized_symbol,
+            "management": management,
+        }
+
+    try:
+        adjustment = executor.adjust_protective_orders(
+            normalized_symbol,
+            entry_side=snapshot.entry_side,
+            stop_loss_price=effective_stop_price,
+            take_profit_price=effective_take_profit_price,
+            current_orders=dict(snapshot.protective_orders),
+        )
+    except BinanceLiveExecutionError as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "reason_code": "adjustment_failed",
+            "symbol": normalized_symbol,
+            "management": management,
+        }
+
+    result = {
+        "success": True,
+        "symbol": normalized_symbol,
+        "execution_mode": "live-adjustment",
+        "management": management,
+        "adjustment": adjustment,
+    }
+    if premium_request is not None and str(premium_request.get("analysis_outcome") or "").strip().lower() == "passed":
+        result["premium_request"] = premium_request
+        result["premium_assessment"] = premium_assessment
+    if notify_whatsapp:
+        result["whatsapp_notification"] = _send_whatsapp_home_message(
+            _build_live_adjustment_whatsapp_message(result)
+        )
+    return result
+
+
 def _paper_decision_result(
     *,
     symbol: str,
@@ -423,13 +1237,13 @@ def _paper_decision_result(
     dry_run: bool,
     use_persistent_account: bool,
 ) -> dict[str, Any]:
-    _ensure_runtime_env_loaded()
+    resolved_mode, limits, active_limits = _resolve_effective_risk_limits(mode)
     proposal = BinanceTradeProposal.from_payload(
         {
             "symbol": symbol,
             "side": side,
             "notional_usd": notional_usd,
-            "mode": mode,
+            "mode": resolved_mode,
             "order_type": order_type,
             "stop_loss_pct": stop_loss_pct or None,
             "take_profit_pct": take_profit_pct or None,
@@ -452,7 +1266,7 @@ def _paper_decision_result(
     decision = evaluate_trade_proposal(
         proposal,
         account,
-        BinanceRiskLimits.from_env(),
+        limits,
         kill_switch_active=is_kill_switch_active(),
     )
     return {
@@ -461,6 +1275,8 @@ def _paper_decision_result(
         "decision": decision,
         "account_source": account_source,
         "paper_account": paper_account_overview,
+        "active_risk_mode": active_limits.mode,
+        "effective_risk_mode": limits.mode,
     }
 
 
@@ -488,7 +1304,8 @@ def _submit_trade_result(
     use_persistent_account: bool = True,
     notify_whatsapp: bool = False,
 ) -> dict[str, Any]:
-    requested_live = str(mode).strip().lower() == "live" and not dry_run
+    normalized_mode, _, _ = _resolve_effective_risk_limits(mode)
+    requested_live = normalized_mode == "live"
     limits = BinanceRiskLimits.from_env()
 
     if not requested_live:
@@ -580,7 +1397,7 @@ def _submit_trade_result(
                 "symbol": symbol,
                 "side": side,
                 "order_type": order_type,
-                "mode": mode,
+                "mode": normalized_mode,
                 "notional_usd": notional_usd,
                 "rationale": rationale,
             },
@@ -597,7 +1414,7 @@ def _submit_trade_result(
             "symbol": symbol,
             "side": side,
             "notional_usd": notional_usd,
-            "mode": mode,
+            "mode": normalized_mode,
             "order_type": order_type,
             "stop_loss_pct": stop_loss_pct or None,
             "take_profit_pct": take_profit_pct or None,
@@ -625,6 +1442,48 @@ def _submit_trade_result(
         }
 
     try:
+        exchange_order_preview = executor.preview_trade(proposal)
+    except BinanceLiveExecutionError as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "decision": decision.to_dict(),
+            "live_account_overview": overview,
+        }
+
+    if dry_run:
+        return {
+            "success": True,
+            "execution_mode": "dry_run",
+            "decision": decision.to_dict(),
+            "account_source": "live_exchange",
+            "live_account_overview": overview,
+            "exchange_order_preview": exchange_order_preview,
+            "order_preview": {
+                "symbol": symbol,
+                "side": side,
+                "order_type": order_type,
+                "mode": normalized_mode,
+                "notional_usd": notional_usd,
+                "rationale": rationale,
+            },
+        }
+
+    approval_record = None
+    if _parse_bool(os.getenv("BINANCE_REQUIRE_TRADE_APPROVAL"), default=True):
+        approved, approval_error, approval_record = validate_trade_approval(
+            approval_id,
+            proposal,
+        )
+        if not approved:
+            return {
+                "success": False,
+                "error": approval_error,
+                "decision": decision.to_dict(),
+                "live_account_overview": overview,
+            }
+
+    try:
         execution = executor.submit_trade(proposal)
     except BinanceLiveExecutionError as exc:
         return {
@@ -634,12 +1493,16 @@ def _submit_trade_result(
             "live_account_overview": overview,
         }
 
+    if approval_record is not None:
+        approval_record = consume_trade_approval(approval_id, proposal)
+
     return {
         "success": True,
         "execution_mode": "live",
         "decision": decision.to_dict(),
         "live_account_overview": overview,
         "execution": execution,
+        "approval": approval_record,
     }
 
 
@@ -656,7 +1519,7 @@ def _build_server():
         instructions=(
             "Guarded Binance trading surface. Use it to validate candidate trades, "
             "inspect the active risk profile, and toggle a kill switch. This "
-            "surface stays paper-first by default, but may route live futures "
+            "surface defaults to the active risk profile mode, but may route live futures "
             "orders only when explicit live credentials and risk mode are enabled."
         ),
     )
@@ -749,7 +1612,7 @@ def _build_server():
         symbol: str,
         side: str,
         notional_usd: float,
-        mode: str = "paper",
+        mode: str = "auto",
         order_type: str = "MARKET",
         stop_loss_pct: float = 0.0,
         take_profit_pct: float = 0.0,
@@ -765,7 +1628,7 @@ def _build_server():
         dry_run: bool = True,
         use_persistent_account: bool = True,
     ) -> str:
-        """Validate a trade proposal against the mandatory local risk policy."""
+        """Validate a trade proposal against the active risk policy; use mode='paper' only for an explicit local simulation."""
 
         paper = _paper_decision_result(
             symbol=symbol,
@@ -793,6 +1656,8 @@ def _build_server():
                 "decision": paper["decision"].to_dict(),
                 "account_source": paper.get("account_source"),
                 "paper_account": paper.get("paper_account"),
+                "active_risk_mode": paper.get("active_risk_mode"),
+                "effective_risk_mode": paper.get("effective_risk_mode"),
             },
             indent=2,
         )
@@ -830,7 +1695,7 @@ def _build_server():
         symbol: str,
         side: str,
         notional_usd: float,
-        mode: str = "paper",
+        mode: str = "auto",
         order_type: str = "MARKET",
         stop_loss_pct: float = 0.0,
         take_profit_pct: float = 0.0,
@@ -850,7 +1715,7 @@ def _build_server():
         use_persistent_account: bool = True,
         notify_whatsapp: bool = False,
     ) -> str:
-        """Create a formal trade approval request that the operator must approve from WhatsApp before entry."""
+        """Create a formal trade approval request that follows the active risk mode unless mode='paper' is requested explicitly."""
 
         paper = _paper_decision_result(
             symbol=symbol,
@@ -910,6 +1775,8 @@ def _build_server():
                     notional_usd=notional_usd,
                     stop_loss_pct=stop_loss_pct,
                     take_profit_pct=take_profit_pct,
+                    expires_at=str(approval.get("expires_at") or ""),
+                    symbol_shortcut=str(symbol).upper().removesuffix("USDT"),
                 )
             )
         return json.dumps(
@@ -918,6 +1785,8 @@ def _build_server():
                 "approval": approval,
                 "decision": decision.to_dict(),
                 "paper_account": paper.get("paper_account"),
+                "active_risk_mode": paper.get("active_risk_mode"),
+                "effective_risk_mode": paper.get("effective_risk_mode"),
                 "whatsapp_notification": whatsapp_notification,
             },
             indent=2,
@@ -964,7 +1833,7 @@ def _build_server():
         symbol: str,
         side: str,
         notional_usd: float,
-        mode: str = "paper",
+        mode: str = "auto",
         order_type: str = "MARKET",
         stop_loss_pct: float = 0.0,
         take_profit_pct: float = 0.0,
@@ -983,7 +1852,7 @@ def _build_server():
         use_persistent_account: bool = True,
         notify_whatsapp: bool = False,
     ) -> str:
-        """Submit a guarded paper preview or a live trade when explicitly armed."""
+        """Submit a guarded preview or trade using the active risk mode unless mode='paper' is requested explicitly."""
 
         return json.dumps(
             _submit_trade_result(

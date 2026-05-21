@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 from tools.binance_guardrails import BinanceTradeProposal
 from tools.binance_paper_runtime import (
     close_paper_position,
+    complete_doge_premium_analysis_request,
+    get_latest_doge_premium_analysis_request,
     get_paper_daily_summary,
     get_paper_account_overview,
+    get_latest_trade_approval,
     get_paper_position_status,
     open_paper_position,
     reconcile_protective_exits,
+    record_doge_premium_analysis_decision,
     record_market_evidence,
+    request_doge_premium_analysis,
     request_trade_approval,
     record_trade_approval,
     seed_paper_account,
@@ -119,6 +125,101 @@ def test_trade_approval_must_match_trade_fingerprint(tmp_path):
 
     assert ok is False
     assert "does not match" in error
+
+
+def test_get_latest_trade_approval_returns_most_recent_match(tmp_path):
+    record_trade_approval(
+        request_trade_approval(_proposal(symbol="DOGEUSDT", notional_usd="20"), home=tmp_path)["approval_id"],
+        decision="deny",
+        home=tmp_path,
+    )
+    latest_pending = request_trade_approval(
+        _proposal(symbol="DOGEUSDT", notional_usd="21"),
+        home=tmp_path,
+    )
+    request_trade_approval(_proposal(symbol="BTCUSDT", notional_usd="40"), home=tmp_path)
+
+    lookup_pending = get_latest_trade_approval(symbol="DOGEUSDT", status="pending", home=tmp_path)
+    lookup_latest = get_latest_trade_approval(symbol="DOGEUSDT", home=tmp_path)
+
+    assert lookup_pending is not None
+    assert lookup_pending["approval_id"] == latest_pending["approval_id"]
+    assert lookup_latest is not None
+    assert lookup_latest["approval_id"] == latest_pending["approval_id"]
+
+
+def test_get_latest_trade_approval_expires_stale_approved_unconsumed_record(tmp_path):
+    stale_approved = {
+        "version": 1,
+        "approvals": [
+            {
+                "approval_id": "TRADE-OLD12345",
+                "created_at": "2026-05-20T05:00:00+00:00",
+                "expires_at": "2026-05-20T05:05:00+00:00",
+                "status": "approved",
+                "requested_via": "cron_15m_doge",
+                "proposal": _proposal(symbol="DOGEUSDT", mode="live").to_dict(),
+                "proposal_fingerprint": "ABC123",
+                "symbol": "DOGEUSDT",
+                "evidence_id": None,
+                "market_summary": "stale approved test",
+                "source_urls": [],
+                "response_text": "approved earlier",
+                "decision_by": "operator",
+                "decided_at": "2026-05-20T05:01:00+00:00",
+                "consumed_at": None,
+            }
+        ],
+    }
+    (tmp_path / "binance-trade-approvals.json").write_text(json.dumps(stale_approved), encoding="utf-8")
+
+    latest = get_latest_trade_approval(symbol="DOGEUSDT", home=tmp_path)
+
+    assert latest is not None
+    assert latest["approval_id"] == "TRADE-OLD12345"
+    assert latest["status"] == "expired"
+
+
+def test_doge_premium_analysis_request_lifecycle_tracks_status_and_fingerprint(tmp_path):
+    request = request_doge_premium_analysis(
+        symbol="DOGEUSDT",
+        request_kind="entry",
+        model="gemini-3.5-flash",
+        material_payload={
+            "event_kind": "entry",
+            "symbol": "DOGEUSDT",
+            "signal": {"score": 6, "verdict": "candidate_long"},
+        },
+        material_summary="entrada premium DOGE",
+        home=tmp_path,
+    )
+
+    latest = get_latest_doge_premium_analysis_request(symbol="DOGEUSDT", request_kind="entry", home=tmp_path)
+
+    assert latest is not None
+    assert latest["request_id"] == request["request_id"]
+    assert latest["status"] == "pending"
+    assert latest["event_fingerprint"] == request["event_fingerprint"]
+
+    approved = record_doge_premium_analysis_decision(request["request_id"], decision="approve", home=tmp_path)
+    completed = complete_doge_premium_analysis_request(
+        request["request_id"],
+        analysis_outcome="passed",
+        analysis={"summary": "Gemini 3.5 Flash confirma la entrada"},
+        home=tmp_path,
+    )
+    by_fingerprint = get_latest_doge_premium_analysis_request(
+        symbol="DOGEUSDT",
+        request_kind="entry",
+        event_fingerprint=request["event_fingerprint"],
+        home=tmp_path,
+    )
+
+    assert approved["status"] == "approved"
+    assert completed["status"] == "completed"
+    assert completed["analysis_outcome"] == "passed"
+    assert by_fingerprint is not None
+    assert by_fingerprint["request_id"] == request["request_id"]
 
 
 def test_reconcile_protective_exits_closes_take_profit_and_updates_balance(tmp_path):

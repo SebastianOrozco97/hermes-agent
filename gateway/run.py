@@ -5774,6 +5774,313 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    @staticmethod
+    def _normalize_trade_symbol_reference(raw_reference: str) -> Optional[str]:
+        normalized = str(raw_reference or "").strip().upper().rstrip(".,;:!?")
+        if not normalized or normalized.startswith(("TRADE-", "PPOS-")):
+            return None
+        if normalized.endswith("USDT") and normalized[:-4].isalpha():
+            return normalized
+        if normalized.isalpha():
+            return f"{normalized}USDT"
+        return None
+
+    @staticmethod
+    def _trade_symbol_shortcut(symbol: str) -> str:
+        normalized = str(symbol or "").strip().upper()
+        if normalized.endswith("USDT"):
+            return normalized[:-4]
+        return normalized
+
+    def _build_trade_approval_status_message(self, approval: dict[str, Any]) -> str:
+        from agent.transports import binance_guarded_mcp_server as guarded
+
+        approval_id = str(approval.get("approval_id") or "").strip().upper()
+        symbol = str(approval.get("symbol") or (approval.get("proposal") or {}).get("symbol") or "").strip().upper()
+        symbol_shortcut = self._trade_symbol_shortcut(symbol)
+        commands = {
+            "status_trade": f"ESTADO {approval_id}" if approval_id else "",
+            "status_symbol": f"ESTADO {symbol_shortcut}" if symbol_shortcut else "",
+            "approve_trade": f"APROBAR {approval_id}" if approval_id else "",
+            "approve_symbol": f"APROBAR {symbol_shortcut}" if symbol_shortcut else "",
+            "reject_trade": f"RECHAZAR {approval_id}" if approval_id else "",
+            "reject_symbol": f"RECHAZAR {symbol_shortcut}" if symbol_shortcut else "",
+        }
+        return guarded._build_paper_status_whatsapp_message(
+            {
+                "status": f"approval_{str(approval.get('status') or 'unknown').strip().lower() or 'unknown'}",
+                "approval": approval,
+                "commands": commands,
+            }
+        )
+
+    def _maybe_handle_plaintext_doge_premium_analysis(self, event: MessageEvent) -> Optional[str]:
+        try:
+            if event.message_type != MessageType.TEXT:
+                return None
+            text = str(event.text or "").strip()
+            if not text or text.startswith("/"):
+                return None
+            source = getattr(event, "source", None)
+            if getattr(source, "chat_type", None) != "dm":
+                return None
+
+            tokens = [token.strip().upper().rstrip(".,;:!?") for token in text.split() if token.strip()]
+            if not tokens:
+                return None
+
+            decision = ""
+            reference = ""
+            if tokens[0] == "ANALIZAR" and len(tokens) >= 2:
+                decision = "approve"
+                reference = tokens[1]
+            elif tokens[0] in {"RECHAZAR", "CANCELAR"} and len(tokens) >= 3 and tokens[1] == "ANALISIS":
+                decision = "deny"
+                reference = tokens[2]
+            else:
+                return None
+
+            symbol = self._normalize_trade_symbol_reference(reference)
+            if symbol is None:
+                return None
+
+            from agent.transports import binance_guarded_mcp_server as guarded
+
+            guarded._ensure_runtime_env_loaded()
+            result = guarded._resolve_doge_premium_analysis_request(symbol=symbol, decision=decision)
+            if result.get("success"):
+                return guarded._build_doge_premium_resolution_whatsapp_message(result)
+            if result.get("request"):
+                return guarded._build_doge_premium_status_whatsapp_message(result.get("request") or {})
+            return result.get("error") or "No pude resolver el analisis premium en este momento."
+        except Exception as exc:
+            logger.warning(
+                "Plaintext DOGE premium analysis shortcut failed for %r: %s",
+                getattr(event, "text", ""),
+                exc,
+            )
+            return "No pude resolver el analisis premium de DOGE en este momento."
+
+    def _maybe_handle_plaintext_live_trade_adjustment(self, event: MessageEvent) -> Optional[str]:
+        try:
+            if event.message_type != MessageType.TEXT:
+                return None
+            text = str(event.text or "").strip()
+            if not text or text.startswith("/"):
+                return None
+            source = getattr(event, "source", None)
+            if getattr(source, "chat_type", None) != "dm":
+                return None
+
+            command, _, raw_reference = text.partition(" ")
+            if command.strip().upper() != "AJUSTAR" or not raw_reference.strip():
+                return None
+
+            symbol = self._normalize_trade_symbol_reference(raw_reference)
+            if symbol is None:
+                return None
+
+            from agent.transports import binance_guarded_mcp_server as guarded
+
+            guarded._ensure_runtime_env_loaded()
+            result = guarded._adjust_live_trade_protection_result(
+                symbol=symbol,
+                notify_whatsapp=False,
+            )
+            if result.get("success"):
+                return guarded._build_live_adjustment_whatsapp_message(result)
+            if result.get("premium_request"):
+                return guarded._build_doge_premium_status_whatsapp_message(result.get("premium_request") or {})
+            return guarded._build_live_adjustment_status_whatsapp_message(result)
+        except Exception as exc:
+            logger.warning(
+                "Plaintext live trade adjustment shortcut failed for %r: %s",
+                getattr(event, "text", ""),
+                exc,
+            )
+            return "No pude ajustar la proteccion live en este momento."
+
+    def _maybe_handle_plaintext_paper_trade_status(self, event: MessageEvent) -> Optional[str]:
+        try:
+            if event.message_type != MessageType.TEXT:
+                return None
+            text = str(event.text or "").strip()
+            if not text or text.startswith("/"):
+                return None
+            source = getattr(event, "source", None)
+            if getattr(source, "chat_type", None) != "dm":
+                return None
+
+            command, _, raw_reference = text.partition(" ")
+            if command.strip().upper() != "ESTADO" or not raw_reference.strip():
+                return None
+
+            reference = raw_reference.strip().upper().rstrip(".,;:!?")
+            from agent.transports import binance_guarded_mcp_server as guarded
+            from tools.binance_paper_runtime import get_latest_doge_premium_analysis_request, get_latest_trade_approval
+
+            guarded._ensure_runtime_env_loaded()
+            if not (reference.startswith("TRADE-") or reference.startswith("PPOS-")):
+                symbol = self._normalize_trade_symbol_reference(reference)
+                if symbol is None:
+                    return None
+                premium_request = get_latest_doge_premium_analysis_request(symbol=symbol, status="pending")
+                if premium_request is not None:
+                    return guarded._build_doge_premium_status_whatsapp_message(premium_request)
+                approval = get_latest_trade_approval(symbol=symbol, status="pending") or get_latest_trade_approval(symbol=symbol)
+                if approval is None:
+                    premium_request = get_latest_doge_premium_analysis_request(symbol=symbol)
+                    if premium_request is not None:
+                        return guarded._build_doge_premium_status_whatsapp_message(premium_request)
+                    symbol_shortcut = self._trade_symbol_shortcut(symbol)
+                    return (
+                        f"No hay una aprobacion registrada para {symbol_shortcut}. "
+                        "El scout la revisa cada 15m y te avisara por WhatsApp cuando detecte una nueva entrada."
+                    )
+                return self._build_trade_approval_status_message(approval)
+
+            status = guarded._paper_position_status_result(
+                reference_id=reference,
+                include_market_price=True,
+            )
+            if not status.get("success"):
+                return f"No encontre ninguna posicion paper activa o historica con el ID {reference}."
+            return guarded._build_paper_status_whatsapp_message(status)
+        except Exception as exc:
+            logger.warning(
+                "Plaintext paper trade status shortcut failed for %r: %s",
+                getattr(event, "text", ""),
+                exc,
+            )
+            return "No pude consultar el estado de la operacion en este momento."
+
+    def _maybe_handle_plaintext_trade_approval_decision(self, event: MessageEvent) -> Optional[str]:
+        approval_id = ""
+        try:
+            if event.message_type != MessageType.TEXT:
+                return None
+            text = str(event.text or "").strip()
+            if not text or text.startswith("/"):
+                return None
+            source = getattr(event, "source", None)
+            if getattr(source, "chat_type", None) != "dm":
+                return None
+
+            command, _, raw_reference = text.partition(" ")
+            normalized_command = command.strip().upper()
+            if normalized_command not in {"APROBAR", "RECHAZAR"} or not raw_reference.strip():
+                return None
+
+            approval_id = raw_reference.strip().upper().rstrip(".,;:!?")
+            from agent.transports import binance_guarded_mcp_server as guarded
+            from tools.binance_paper_runtime import get_latest_trade_approval, get_trade_approval
+
+            guarded._ensure_runtime_env_loaded()
+            if not approval_id.startswith("TRADE-"):
+                symbol = self._normalize_trade_symbol_reference(approval_id)
+                if symbol is None:
+                    return None
+                pending = get_latest_trade_approval(symbol=symbol, status="pending")
+                if pending is None:
+                    latest = get_latest_trade_approval(symbol=symbol)
+                    symbol_shortcut = self._trade_symbol_shortcut(symbol)
+                    if latest is None:
+                        return (
+                            f"No hay una aprobacion pendiente para {symbol_shortcut}. "
+                            "El scout sigue revisando cada 15m y te avisara por WhatsApp cuando encuentre una nueva entrada."
+                        )
+                    latest_id = str(latest.get("approval_id") or "").strip().upper() or "n/d"
+                    latest_status = str(latest.get("status") or "").strip().lower() or "desconocida"
+                    label = {
+                        "pending": "pendiente",
+                        "approved": "aprobada",
+                        "denied": "rechazada",
+                        "expired": "expirada",
+                    }.get(latest_status, latest_status)
+                    return (
+                        f"No hay una aprobacion pendiente para {symbol_shortcut}. "
+                        f"Ultima registrada: {latest_id} ({label}). Escribe ESTADO {symbol_shortcut}."
+                    )
+                approval_id = str(pending.get("approval_id") or "").strip().upper()
+
+            approval = guarded.record_trade_approval(
+                approval_id,
+                decision="approve" if normalized_command == "APROBAR" else "deny",
+                response_text=f"Decision via WhatsApp DM: {normalized_command}",
+                responder="operator",
+            )
+            if normalized_command == "APROBAR":
+                proposal = approval.get("proposal") or {}
+                execution_result = guarded._submit_trade_result(
+                    symbol=str(proposal.get("symbol") or ""),
+                    side=str(proposal.get("side") or ""),
+                    notional_usd=float(proposal.get("notional_usd") or 0.0),
+                    mode=str(proposal.get("mode") or "paper"),
+                    order_type=str(proposal.get("order_type") or "MARKET"),
+                    stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
+                    take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
+                    leverage=float(proposal.get("leverage") or 1.0),
+                    free_balance_usd=0.0,
+                    open_positions=0,
+                    positions_in_symbol=0,
+                    daily_realized_pnl_usd=0.0,
+                    verifier_model=str(proposal.get("verifier_model") or ""),
+                    verifier_passed=bool(proposal.get("verifier_passed")),
+                    verifier_confidence=float(proposal.get("verifier_confidence") or 0.0),
+                    rationale=str(proposal.get("rationale") or ""),
+                    dry_run=False,
+                    approval_id=approval_id,
+                    evidence_id=str(approval.get("evidence_id") or ""),
+                    use_persistent_account=True,
+                    notify_whatsapp=False,
+                )
+                if execution_result.get("success"):
+                    if execution_result.get("execution_mode") == "paper":
+                        return guarded._build_paper_entry_whatsapp_message(
+                            execution_result.get("paper_execution") or {}
+                        )
+                    if execution_result.get("execution_mode") == "live":
+                        return guarded._build_live_entry_whatsapp_message(execution_result)
+                return (
+                    f"Aprobacion {approval_id} aprobada, pero la ejecucion no se completo.\n"
+                    f"Motivo: {execution_result.get('error') or 'error desconocido'}\n"
+                    f"Seguimiento: ESTADO {approval_id}"
+                )
+
+            status = guarded._paper_position_status_result(
+                reference_id=approval_id,
+                include_market_price=False,
+            )
+            if status.get("success"):
+                return guarded._build_paper_status_whatsapp_message(status)
+
+            label = "aprobada" if normalized_command == "APROBAR" else "rechazada"
+            return (
+                f"Aprobacion {approval_id} {label}. Estado actual: {label}.\n"
+                f"Seguimiento: ESTADO {approval_id}"
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "has expired" in message and approval_id:
+                approval = get_trade_approval(approval_id)
+                symbol = self._trade_symbol_shortcut(
+                    str((approval or {}).get("symbol") or ((approval or {}).get("proposal") or {}).get("symbol") or "")
+                )
+                if symbol:
+                    return (
+                        f"La aprobacion {approval_id} ya expiro. "
+                        f"Escribe ESTADO {symbol} y, si hay una nueva senal vigente, podras responder APROBAR {symbol}."
+                    )
+                return f"La aprobacion {approval_id} ya expiro. Espera la siguiente senal vigente."
+            return message
+        except Exception as exc:
+            logger.warning(
+                "Plaintext trade approval shortcut failed for %r: %s",
+                getattr(event, "text", ""),
+                exc,
+            )
+            return "No pude registrar la decision de la operacion en este momento."
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6028,6 +6335,22 @@ class GatewayRunner:
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        _premium_analysis_shortcut = self._maybe_handle_plaintext_doge_premium_analysis(event)
+        if _premium_analysis_shortcut is not None:
+            return _premium_analysis_shortcut
+
+        _trade_approval_shortcut = self._maybe_handle_plaintext_trade_approval_decision(event)
+        if _trade_approval_shortcut is not None:
+            return _trade_approval_shortcut
+
+        _live_trade_adjustment_shortcut = self._maybe_handle_plaintext_live_trade_adjustment(event)
+        if _live_trade_adjustment_shortcut is not None:
+            return _live_trade_adjustment_shortcut
+
+        _paper_status_shortcut = self._maybe_handle_plaintext_paper_trade_status(event)
+        if _paper_status_shortcut is not None:
+            return _paper_status_shortcut
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages

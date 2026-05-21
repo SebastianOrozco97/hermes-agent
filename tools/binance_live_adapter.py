@@ -75,6 +75,7 @@ def _quantize_to_step(value: Decimal, step: Decimal, *, rounding: str) -> Decima
 class SymbolTradingRules:
     quantity_step: Decimal
     price_tick: Decimal
+    min_notional: Decimal
 
 
 class BinanceFuturesLiveExecutor:
@@ -200,6 +201,29 @@ class BinanceFuturesLiveExecutor:
             mark_price = body.get("price") if isinstance(body, dict) else None
         return _parse_decimal(mark_price, field_name="reference price")
 
+    def get_klines(self, symbol: str, *, interval: str = "15m", limit: int = 120) -> list[list[Any]]:
+        normalized_symbol = str(symbol).strip().upper()
+        normalized_interval = str(interval).strip() or "15m"
+        normalized_limit = max(10, min(int(limit), 500))
+        if not normalized_symbol:
+            raise BinanceLiveExecutionError("symbol is required for Binance kline lookup")
+
+        body = self._request(
+            "GET",
+            "/fapi/v1/klines",
+            params={
+                "symbol": normalized_symbol,
+                "interval": normalized_interval,
+                "limit": normalized_limit,
+            },
+            signed=False,
+        )
+        if not isinstance(body, list) or not body:
+            raise BinanceLiveExecutionError(
+                f"No kline data returned for {normalized_symbol} {normalized_interval}"
+            )
+        return body
+
     def _get_symbol_rules(self, symbol: str) -> SymbolTradingRules:
         normalized_symbol = str(symbol).strip().upper()
         cached = self._symbol_rules_cache.get(normalized_symbol)
@@ -215,9 +239,15 @@ class BinanceFuturesLiveExecutor:
         symbols = body.get("symbols") if isinstance(body, dict) else None
         if not symbols:
             raise BinanceLiveExecutionError(f"No exchange info available for symbol {normalized_symbol}")
-        symbol_info = symbols[0]
+        symbol_info = next(
+            (item for item in symbols if str(item.get("symbol", "")).strip().upper() == normalized_symbol),
+            None,
+        )
+        if symbol_info is None:
+            raise BinanceLiveExecutionError(f"Symbol {normalized_symbol} was not found in Binance exchange info")
         quantity_step = Decimal("0")
         price_tick = Decimal("0")
+        min_notional = Decimal("0")
         for item in symbol_info.get("filters", []):
             if item.get("filterType") == "MARKET_LOT_SIZE" and Decimal(str(item.get("stepSize", "0"))) > 0:
                 quantity_step = Decimal(str(item.get("stepSize", "0")))
@@ -225,11 +255,17 @@ class BinanceFuturesLiveExecutor:
                 quantity_step = Decimal(str(item.get("stepSize", "0")))
             elif item.get("filterType") == "PRICE_FILTER":
                 price_tick = Decimal(str(item.get("tickSize", "0")))
+            elif item.get("filterType") == "MIN_NOTIONAL":
+                min_notional = Decimal(str(item.get("notional", item.get("minNotional", "0"))))
 
         if quantity_step <= 0 or price_tick <= 0:
             raise BinanceLiveExecutionError(f"Incomplete trading rules for symbol {normalized_symbol}")
 
-        rules = SymbolTradingRules(quantity_step=quantity_step, price_tick=price_tick)
+        rules = SymbolTradingRules(
+            quantity_step=quantity_step,
+            price_tick=price_tick,
+            min_notional=min_notional,
+        )
         self._symbol_rules_cache[normalized_symbol] = rules
         return rules
 
@@ -305,7 +341,30 @@ class BinanceFuturesLiveExecutor:
             raise BinanceLiveExecutionError(
                 f"proposal notional {proposal.notional_usd} is too small for {proposal.symbol} at price {price}"
             )
+        estimated_notional = quantity * price
+        if rules.min_notional > 0 and estimated_notional < rules.min_notional:
+            raise BinanceLiveExecutionError(
+                f"proposal resolves to { _format_decimal(estimated_notional) } USDT after quantity rounding, "
+                f"below Binance minimum notional { _format_decimal(rules.min_notional) } for {proposal.symbol}"
+            )
         return quantity, rules
+
+    def preview_trade(self, proposal: BinanceTradeProposal) -> dict[str, Any]:
+        reference_price = self.get_reference_price(proposal.symbol)
+        quantity, rules = self._resolve_quantity(proposal, reference_price)
+        estimated_notional = quantity * reference_price
+        return {
+            "symbol": proposal.symbol,
+            "side": proposal.side,
+            "quantity": _format_decimal(quantity),
+            "reference_price": _format_decimal(reference_price),
+            "estimated_notional_usd": _format_decimal(estimated_notional),
+            "rules": {
+                "quantity_step": _format_decimal(rules.quantity_step),
+                "price_tick": _format_decimal(rules.price_tick),
+                "min_notional": _format_decimal(rules.min_notional),
+            },
+        }
 
     def _protective_price(
         self,
@@ -328,10 +387,114 @@ class BinanceFuturesLiveExecutor:
             raise BinanceLiveExecutionError(f"computed {purpose} price is invalid: {price}")
         return price
 
+    def _protective_rounding(self, *, entry_side: str, purpose: str) -> str:
+        normalized_side = str(entry_side or "").strip().upper()
+        if normalized_side not in {"BUY", "SELL"}:
+            raise BinanceLiveExecutionError("entry_side must be BUY or SELL")
+        normalized_purpose = str(purpose or "").strip().lower()
+        if normalized_purpose not in {"stop_loss", "take_profit"}:
+            raise BinanceLiveExecutionError("purpose must be stop_loss or take_profit")
+        if normalized_side == "BUY":
+            return "down" if normalized_purpose == "stop_loss" else "up"
+        return "up" if normalized_purpose == "stop_loss" else "down"
+
+    def normalize_protective_price(
+        self,
+        *,
+        symbol: str,
+        entry_side: str,
+        purpose: str,
+        price: Decimal,
+        rules: Optional[SymbolTradingRules] = None,
+    ) -> Decimal:
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise BinanceLiveExecutionError("symbol is required for protective price normalization")
+        normalized_price = _parse_decimal(price, field_name=f"{purpose} price")
+        resolved_rules = rules or self._get_symbol_rules(normalized_symbol)
+        rounded_price = _quantize_to_step(
+            normalized_price,
+            resolved_rules.price_tick,
+            rounding=self._protective_rounding(entry_side=entry_side, purpose=purpose),
+        )
+        if rounded_price <= 0:
+            raise BinanceLiveExecutionError(f"normalized {purpose} price is invalid: {rounded_price}")
+        return rounded_price
+
+    def _close_side(self, entry_side: str) -> str:
+        normalized_side = str(entry_side or "").strip().upper()
+        if normalized_side == "BUY":
+            return "SELL"
+        if normalized_side == "SELL":
+            return "BUY"
+        raise BinanceLiveExecutionError("entry_side must be BUY or SELL")
+
     def _base_order_params(self) -> dict[str, str]:
         if self.position_side:
             return {"positionSide": self.position_side}
         return {}
+
+    def _place_protective_orders(
+        self,
+        *,
+        symbol: str,
+        entry_side: str,
+        stop_loss_price: Decimal,
+        take_profit_price: Decimal,
+        rules: Optional[SymbolTradingRules] = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = str(symbol).strip().upper()
+        resolved_rules = rules or self._get_symbol_rules(normalized_symbol)
+        normalized_stop_price = self.normalize_protective_price(
+            symbol=normalized_symbol,
+            entry_side=entry_side,
+            purpose="stop_loss",
+            price=stop_loss_price,
+            rules=resolved_rules,
+        )
+        normalized_take_profit_price = self.normalize_protective_price(
+            symbol=normalized_symbol,
+            entry_side=entry_side,
+            purpose="take_profit",
+            price=take_profit_price,
+            rules=resolved_rules,
+        )
+        close_side = self._close_side(entry_side)
+
+        common = {
+            "symbol": normalized_symbol,
+            "side": close_side,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+            "priceProtect": "true",
+            **self._base_order_params(),
+        }
+        stop_order = self._request(
+            "POST",
+            "/fapi/v1/order",
+            params={
+                **common,
+                "type": "STOP_MARKET",
+                "stopPrice": _format_decimal(normalized_stop_price),
+            },
+            signed=True,
+        )
+        take_profit_order = self._request(
+            "POST",
+            "/fapi/v1/order",
+            params={
+                **common,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": _format_decimal(normalized_take_profit_price),
+            },
+            signed=True,
+        )
+        return {
+            "stop_loss": stop_order,
+            "take_profit": take_profit_order,
+            "stop_loss_price": _format_decimal(normalized_stop_price),
+            "take_profit_price": _format_decimal(normalized_take_profit_price),
+        }
 
     def _arm_protective_orders(
         self,
@@ -355,40 +518,133 @@ class BinanceFuturesLiveExecutor:
             purpose="take_profit",
             tick=rules.price_tick,
         )
+        return self._place_protective_orders(
+            symbol=proposal.symbol,
+            entry_side=proposal.side,
+            stop_loss_price=stop_price,
+            take_profit_price=take_profit_price,
+            rules=rules,
+        )
 
-        common = {
-            "symbol": proposal.symbol,
-            "side": close_side,
-            "closePosition": "true",
-            "workingType": "MARK_PRICE",
-            "priceProtect": "true",
-            **self._base_order_params(),
-        }
-        stop_order = self._request(
-            "POST",
-            "/fapi/v1/order",
-            params={
-                **common,
-                "type": "STOP_MARKET",
-                "stopPrice": _format_decimal(stop_price),
-            },
+    def get_protective_orders(self, symbol: str, *, entry_side: str = "") -> dict[str, Any]:
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise BinanceLiveExecutionError("symbol is required for open-order lookup")
+        expected_close_side = self._close_side(entry_side) if str(entry_side or "").strip() else ""
+        body = self._request(
+            "GET",
+            "/fapi/v1/openOrders",
+            params={"symbol": normalized_symbol},
             signed=True,
         )
-        take_profit_order = self._request(
-            "POST",
-            "/fapi/v1/order",
-            params={
-                **common,
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": _format_decimal(take_profit_price),
-            },
-            signed=True,
-        )
+        if not isinstance(body, list):
+            raise BinanceLiveExecutionError(
+                f"unexpected openOrders payload for {normalized_symbol}: {type(body).__name__}"
+            )
+
+        def _order_rank(order: dict[str, Any]) -> int:
+            for field in ("updateTime", "time", "orderId"):
+                try:
+                    return int(order.get(field) or 0)
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        stop_order: Optional[dict[str, Any]] = None
+        take_profit_order: Optional[dict[str, Any]] = None
+        protective_orders: list[dict[str, Any]] = []
+        for order in body:
+            if str(order.get("symbol", "") or "").strip().upper() != normalized_symbol:
+                continue
+            if expected_close_side and str(order.get("side", "") or "").strip().upper() != expected_close_side:
+                continue
+            if str(order.get("closePosition", "") or "").strip().lower() != "true" and not _parse_bool(order.get("reduceOnly"), default=False):
+                continue
+            order_type = str(order.get("type", "") or "").strip().upper()
+            if order_type not in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+                continue
+            protective_orders.append(order)
+            if order_type == "STOP_MARKET":
+                if stop_order is None or _order_rank(order) >= _order_rank(stop_order):
+                    stop_order = order
+            elif order_type == "TAKE_PROFIT_MARKET":
+                if take_profit_order is None or _order_rank(order) >= _order_rank(take_profit_order):
+                    take_profit_order = order
+
         return {
+            "symbol": normalized_symbol,
+            "entry_side": str(entry_side or "").strip().upper() or None,
+            "orders": protective_orders,
             "stop_loss": stop_order,
             "take_profit": take_profit_order,
-            "stop_loss_price": _format_decimal(stop_price),
-            "take_profit_price": _format_decimal(take_profit_price),
+            "stop_loss_price": str((stop_order or {}).get("stopPrice") or ""),
+            "take_profit_price": str((take_profit_order or {}).get("stopPrice") or ""),
+        }
+
+    def cancel_order(self, symbol: str, order_id: Any) -> dict[str, Any]:
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise BinanceLiveExecutionError("symbol is required to cancel a Binance order")
+        try:
+            normalized_order_id = int(order_id)
+        except (TypeError, ValueError) as exc:
+            raise BinanceLiveExecutionError("order_id must be an integer") from exc
+        return self._request(
+            "DELETE",
+            "/fapi/v1/order",
+            params={"symbol": normalized_symbol, "orderId": normalized_order_id},
+            signed=True,
+        )
+
+    def adjust_protective_orders(
+        self,
+        symbol: str,
+        *,
+        entry_side: str,
+        stop_loss_price: Decimal,
+        take_profit_price: Decimal,
+        current_orders: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise BinanceLiveExecutionError("symbol is required for protective-order adjustment")
+        normalized_entry_side = str(entry_side or "").strip().upper()
+        if normalized_entry_side not in {"BUY", "SELL"}:
+            raise BinanceLiveExecutionError("entry_side must be BUY or SELL")
+
+        previous_orders = current_orders or self.get_protective_orders(normalized_symbol, entry_side=normalized_entry_side)
+        rules = self._get_symbol_rules(normalized_symbol)
+        new_orders = self._place_protective_orders(
+            symbol=normalized_symbol,
+            entry_side=normalized_entry_side,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+            rules=rules,
+        )
+
+        cancelled_orders = []
+        cancellation_errors: list[str] = []
+        for order in previous_orders.get("orders") or []:
+            order_id = order.get("orderId")
+            if order_id in (None, ""):
+                continue
+            try:
+                cancelled_orders.append(self.cancel_order(normalized_symbol, order_id))
+            except Exception as exc:
+                cancellation_errors.append(str(exc))
+
+        if cancellation_errors:
+            raise BinanceLiveExecutionError(
+                "new protective orders were armed, but cancelling previous protective orders failed: "
+                + "; ".join(cancellation_errors)
+            )
+
+        return {
+            "symbol": normalized_symbol,
+            "entry_side": normalized_entry_side,
+            "previous_orders": previous_orders,
+            "new_orders": new_orders,
+            "cancelled_orders": cancelled_orders,
         }
 
     def _rollback_entry(self, proposal: BinanceTradeProposal, quantity: Decimal) -> dict[str, Any]:

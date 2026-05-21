@@ -189,6 +189,11 @@ def _trade_approval_ttl_minutes(default: int = 30) -> int:
     return max(1, _parse_int(raw, "BINANCE_TRADE_APPROVAL_TTL_MIN"))
 
 
+def _doge_premium_analysis_ttl_minutes(default: int = 5) -> int:
+    raw = os.getenv("DOGE_PREMIUM_ANALYSIS_TTL_MIN", str(default)).strip() or str(default)
+    return max(1, _parse_int(raw, "DOGE_PREMIUM_ANALYSIS_TTL_MIN"))
+
+
 def get_paper_state_path(home: Optional[Path] = None) -> Path:
     hermes_home = Path(home) if home is not None else get_hermes_home()
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -211,6 +216,12 @@ def get_trade_approvals_path(home: Optional[Path] = None) -> Path:
     hermes_home = Path(home) if home is not None else get_hermes_home()
     hermes_home.mkdir(parents=True, exist_ok=True)
     return hermes_home / "binance-trade-approvals.json"
+
+
+def get_doge_premium_requests_path(home: Optional[Path] = None) -> Path:
+    hermes_home = Path(home) if home is not None else get_hermes_home()
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    return hermes_home / "doge-premium-analysis-requests.json"
 
 
 def _default_state(starting_balance: Decimal) -> dict[str, Any]:
@@ -249,6 +260,19 @@ def _load_approvals(home: Optional[Path] = None) -> dict[str, Any]:
 
 def _save_approvals(payload: dict[str, Any], home: Optional[Path] = None) -> None:
     _write_json(get_trade_approvals_path(home=home), payload)
+
+
+def _load_doge_premium_requests(home: Optional[Path] = None) -> dict[str, Any]:
+    payload = _read_json(get_doge_premium_requests_path(home=home), None)
+    if not isinstance(payload, dict):
+        return {"version": 1, "requests": []}
+    payload.setdefault("version", 1)
+    payload.setdefault("requests", [])
+    return payload
+
+
+def _save_doge_premium_requests(payload: dict[str, Any], home: Optional[Path] = None) -> None:
+    _write_json(get_doge_premium_requests_path(home=home), payload)
 
 
 @dataclass(frozen=True)
@@ -628,6 +652,244 @@ def _approval_expired(record: dict[str, Any]) -> bool:
     return _now_utc() >= expiry
 
 
+def _approval_should_expire(record: dict[str, Any]) -> bool:
+    status = str(record.get("status", "")).strip().lower()
+    if status == "pending":
+        return _approval_expired(record)
+    if status == "approved" and not record.get("consumed_at"):
+        return _approval_expired(record)
+    return False
+
+
+def _premium_request_expired(record: dict[str, Any]) -> bool:
+    return _approval_expired(record)
+
+
+def _material_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16].upper()
+
+
+def request_doge_premium_analysis(
+    *,
+    symbol: str,
+    request_kind: str,
+    model: str,
+    material_payload: dict[str, Any],
+    material_summary: str = "",
+    requested_via: str = "cron_15m_doge",
+    expires_minutes: int = 0,
+    high_risk: bool = False,
+    fallback_allowed: bool = True,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_kind = str(request_kind or "").strip().lower()
+    normalized_model = str(model or "").strip()
+    if normalized_symbol != "DOGEUSDT":
+        raise ValueError("premium DOGE analysis only supports DOGEUSDT")
+    if normalized_kind not in {"entry", "adjustment"}:
+        raise ValueError("request_kind must be entry or adjustment")
+    if not normalized_model:
+        raise ValueError("model is required for premium DOGE analysis")
+    if not isinstance(material_payload, dict) or not material_payload:
+        raise ValueError("material_payload is required for premium DOGE analysis")
+
+    request_store = _load_doge_premium_requests(home=home)
+    ttl = expires_minutes if expires_minutes > 0 else _doge_premium_analysis_ttl_minutes()
+    request_id = f"PREM-{uuid.uuid4().hex[:8].upper()}"
+    event_fingerprint = _material_fingerprint(material_payload)
+    record = {
+        "request_id": request_id,
+        "created_at": _now_iso(),
+        "expires_at": (_now_utc() + timedelta(minutes=ttl)).isoformat(),
+        "status": "pending",
+        "analysis_outcome": None,
+        "requested_via": str(requested_via or "cron_15m_doge").strip() or "cron_15m_doge",
+        "symbol": normalized_symbol,
+        "request_kind": normalized_kind,
+        "model": normalized_model,
+        "event_fingerprint": event_fingerprint,
+        "material_summary": str(material_summary or "").strip() or None,
+        "material_payload": material_payload,
+        "high_risk": bool(high_risk),
+        "fallback_allowed": bool(fallback_allowed),
+        "response_text": None,
+        "decision_by": None,
+        "decided_at": None,
+        "completed_at": None,
+        "analysis": None,
+    }
+    request_store.setdefault("requests", []).append(record)
+    _save_doge_premium_requests(request_store, home=home)
+    _append_jsonl(
+        get_paper_journal_path(home=home),
+        {
+            "event_type": "doge_premium_analysis_requested",
+            "recorded_at": record["created_at"],
+            "request_id": request_id,
+            "symbol": normalized_symbol,
+            "request_kind": normalized_kind,
+            "event_fingerprint": event_fingerprint,
+            "model": normalized_model,
+            "high_risk": bool(high_risk),
+        },
+    )
+    return record
+
+
+def get_doge_premium_analysis_request(
+    request_id: str,
+    *,
+    home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    normalized_id = str(request_id or "").strip().upper()
+    if not normalized_id:
+        return None
+    payload = _load_doge_premium_requests(home=home)
+    dirty = False
+    for record in payload.get("requests", []):
+        if str(record.get("request_id", "")).strip().upper() != normalized_id:
+            continue
+        if record.get("status") == "pending" and _premium_request_expired(record):
+            record["status"] = "expired"
+            dirty = True
+        if dirty:
+            _save_doge_premium_requests(payload, home=home)
+        return record
+    return None
+
+
+def get_latest_doge_premium_analysis_request(
+    *,
+    symbol: str = "",
+    request_kind: str = "",
+    status: str = "",
+    event_fingerprint: str = "",
+    home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_kind = str(request_kind or "").strip().lower()
+    normalized_status = str(status or "").strip().lower()
+    normalized_fingerprint = str(event_fingerprint or "").strip().upper()
+    payload = _load_doge_premium_requests(home=home)
+    requests = payload.get("requests", [])
+    dirty = False
+
+    for record in requests:
+        if record.get("status") == "pending" and _premium_request_expired(record):
+            record["status"] = "expired"
+            dirty = True
+
+    if dirty:
+        _save_doge_premium_requests(payload, home=home)
+
+    for record in reversed(requests):
+        record_symbol = str(record.get("symbol", "") or "").strip().upper()
+        record_kind = str(record.get("request_kind", "") or "").strip().lower()
+        record_status = str(record.get("status", "") or "").strip().lower()
+        record_fingerprint = str(record.get("event_fingerprint", "") or "").strip().upper()
+        if normalized_symbol and record_symbol != normalized_symbol:
+            continue
+        if normalized_kind and record_kind != normalized_kind:
+            continue
+        if normalized_status and record_status != normalized_status:
+            continue
+        if normalized_fingerprint and record_fingerprint != normalized_fingerprint:
+            continue
+        return record
+    return None
+
+
+def record_doge_premium_analysis_decision(
+    request_id: str,
+    *,
+    decision: str,
+    response_text: str = "",
+    responder: str = "operator",
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    normalized_id = str(request_id or "").strip().upper()
+    normalized_decision = str(decision or "").strip().lower()
+    if normalized_decision in {"approve", "approved", "yes", "y"}:
+        next_status = "approved"
+    elif normalized_decision in {"deny", "denied", "reject", "rejected", "cancel", "canceled", "no", "n"}:
+        next_status = "denied"
+    else:
+        raise ValueError("decision must be approve or deny")
+
+    payload = _load_doge_premium_requests(home=home)
+    for record in payload.get("requests", []):
+        if str(record.get("request_id", "")).strip().upper() != normalized_id:
+            continue
+        if _premium_request_expired(record):
+            record["status"] = "expired"
+            _save_doge_premium_requests(payload, home=home)
+            raise ValueError(f"request_id '{normalized_id}' has expired")
+        if record.get("status") != "pending":
+            raise ValueError(f"request_id '{normalized_id}' is already {record.get('status')}")
+        record["status"] = next_status
+        record["response_text"] = str(response_text or "").strip() or None
+        record["decision_by"] = str(responder or "operator").strip() or "operator"
+        record["decided_at"] = _now_iso()
+        _save_doge_premium_requests(payload, home=home)
+        _append_jsonl(
+            get_paper_journal_path(home=home),
+            {
+                "event_type": "doge_premium_analysis_recorded",
+                "recorded_at": record["decided_at"],
+                "request_id": normalized_id,
+                "symbol": record.get("symbol"),
+                "request_kind": record.get("request_kind"),
+                "status": next_status,
+            },
+        )
+        return record
+    raise ValueError(f"request_id '{normalized_id}' was not found")
+
+
+def complete_doge_premium_analysis_request(
+    request_id: str,
+    *,
+    analysis_outcome: str,
+    analysis: Optional[dict[str, Any]] = None,
+    response_text: str = "",
+    responder: str = "system",
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    normalized_id = str(request_id or "").strip().upper()
+    normalized_outcome = str(analysis_outcome or "").strip().lower()
+    if normalized_outcome not in {"passed", "rejected", "error", "skipped"}:
+        raise ValueError("analysis_outcome must be passed, rejected, error, or skipped")
+
+    payload = _load_doge_premium_requests(home=home)
+    for record in payload.get("requests", []):
+        if str(record.get("request_id", "")).strip().upper() != normalized_id:
+            continue
+        if record.get("status") not in {"approved", "completed", "expired", "denied"}:
+            raise ValueError(f"request_id '{normalized_id}' cannot be completed from status {record.get('status')}")
+        record["status"] = "completed"
+        record["analysis_outcome"] = normalized_outcome
+        record["analysis"] = analysis or None
+        record["response_text"] = str(response_text or record.get("response_text") or "").strip() or None
+        record["decision_by"] = str(responder or record.get("decision_by") or "system").strip() or "system"
+        record["completed_at"] = _now_iso()
+        _save_doge_premium_requests(payload, home=home)
+        _append_jsonl(
+            get_paper_journal_path(home=home),
+            {
+                "event_type": "doge_premium_analysis_completed",
+                "recorded_at": record["completed_at"],
+                "request_id": normalized_id,
+                "symbol": record.get("symbol"),
+                "request_kind": record.get("request_kind"),
+                "analysis_outcome": normalized_outcome,
+            },
+        )
+        return record
+    raise ValueError(f"request_id '{normalized_id}' was not found")
+
+
 def request_trade_approval(
     proposal: BinanceTradeProposal,
     *,
@@ -737,11 +999,42 @@ def get_trade_approval(approval_id: str, *, home: Optional[Path] = None) -> Opti
     for record in payload.get("approvals", []):
         if str(record.get("approval_id", "")).strip().upper() != normalized_id:
             continue
-        if record.get("status") == "pending" and _approval_expired(record):
+        if _approval_should_expire(record):
             record["status"] = "expired"
             dirty = True
         if dirty:
             _save_approvals(payload, home=home)
+        return record
+    return None
+
+
+def get_latest_trade_approval(
+    *,
+    symbol: str = "",
+    status: str = "",
+    home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_status = str(status or "").strip().lower()
+    payload = _load_approvals(home=home)
+    approvals = payload.get("approvals", [])
+    dirty = False
+
+    for record in approvals:
+        if _approval_should_expire(record):
+            record["status"] = "expired"
+            dirty = True
+
+    if dirty:
+        _save_approvals(payload, home=home)
+
+    for record in reversed(approvals):
+        record_symbol = str(record.get("symbol", "") or "").strip().upper()
+        record_status = str(record.get("status", "") or "").strip().lower()
+        if normalized_symbol and record_symbol != normalized_symbol:
+            continue
+        if normalized_status and record_status != normalized_status:
+            continue
         return record
     return None
 

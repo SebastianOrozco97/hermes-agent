@@ -115,6 +115,426 @@ class TestSlashCommands:
         runner.request_restart.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_plaintext_trade_status_id_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "_paper_position_status_result",
+            lambda **kwargs: {
+                "success": True,
+                "status": "closed",
+                "position": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "position_id": "PPOS-123",
+                    "approval_id": "TRADE-123",
+                },
+                "closed_at": "2026-05-19T01:06:05+00:00",
+                "exit_price": "0.10499",
+                "trigger": "manual",
+                "realized_pnl_usd": "0.13",
+                "realized_pnl_pct": "0.66",
+                "duration_human": "3h 46m 56s",
+                "reason": "Solicitado por el usuario por chat.",
+                "commands": {"status_trade": "ESTADO TRADE-123"},
+            },
+        )
+
+        send = await send_and_capture(adapter, "ESTADO TRADE-123", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Paper cerrado DOGEUSDT BUY | PPOS-123" in response_text
+        assert "Seguimiento: ESTADO TRADE-123" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_status_in_group_stays_plain_text(self, adapter, runner, platform):
+        runner._handle_message_with_agent = AsyncMock(return_value="agent-handled")
+
+        send = await send_and_capture(
+            adapter,
+            "ESTADO TRADE-123",
+            platform,
+            chat_id="group-chat-1",
+            user_id="u1",
+            chat_type="group",
+        )
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert response_text == "agent-handled"
+        runner._handle_message_with_agent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_approval_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "record_trade_approval",
+            lambda approval_id, **kwargs: {
+                "approval_id": approval_id,
+                "status": "approved",
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "2",
+                    "mode": "live",
+                    "order_type": "MARKET",
+                    "stop_loss_pct": "0.5",
+                    "take_profit_pct": "1",
+                    "leverage": "1",
+                    "verifier_model": "doge-scout-v1",
+                    "verifier_passed": True,
+                    "verifier_confidence": "0.88",
+                },
+            },
+        )
+        monkeypatch.setattr(
+            guarded,
+            "_submit_trade_result",
+            lambda **kwargs: {
+                "success": True,
+                "execution_mode": "live",
+                "approval": {"approval_id": "TRADE-123"},
+                "decision": {
+                    "proposal": {
+                        "symbol": "DOGEUSDT",
+                        "side": "BUY",
+                        "notional_usd": "2",
+                        "leverage": "1",
+                    }
+                },
+                "execution": {
+                    "quantity": "20",
+                    "entry_order": {
+                        "avgPrice": "0.1001",
+                        "executedQty": "20",
+                        "status": "FILLED",
+                        "updateTime": 1779268200000,
+                    },
+                    "protective_orders": {
+                        "stop_loss_price": "0.0996",
+                        "take_profit_price": "0.1011",
+                    },
+                },
+            },
+        )
+
+        send = await send_and_capture(adapter, "APROBAR TRADE-123", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Live ejecutado BUY DOGEUSDT | TRADE-123" in response_text
+        assert "esperar radar 15m" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_status_symbol_returns_latest_approval(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_latest_trade_approval",
+            lambda **kwargs: {
+                "approval_id": "TRADE-123",
+                "status": "pending",
+                "symbol": "DOGEUSDT",
+                "created_at": "2026-05-20T06:30:04+00:00",
+                "expires_at": "2026-05-20T07:00:04+00:00",
+                "market_summary": "DOGE mantiene sesgo alcista en 15m con medias ascendentes.",
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "5.25",
+                    "stop_loss_pct": "0.5",
+                    "take_profit_pct": "1.0",
+                },
+            },
+        )
+
+        send = await send_and_capture(adapter, "ESTADO DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Aprobacion TRADE-123 pendiente" in response_text
+        assert "APROBAR DOGE" in response_text
+        assert "ESTADO DOGE" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_status_symbol_prefers_pending_premium_request(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_latest_doge_premium_analysis_request",
+            lambda **kwargs: {
+                "request_id": "PREM-123",
+                "status": "pending",
+                "symbol": "DOGEUSDT",
+                "request_kind": "adjustment",
+                "model": "gemini-3.5-flash",
+                "expires_at": "2026-05-20T07:00:00+00:00",
+                "material_payload": {
+                    "adjustment_context": {
+                        "summary": "subir SL para asegurar beneficio",
+                    }
+                },
+            },
+        )
+        monkeypatch.setattr(paper_runtime, "get_latest_trade_approval", lambda **kwargs: None)
+
+        send = await send_and_capture(adapter, "ESTADO DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Analisis premium pendiente DOGEUSDT" in response_text
+        assert "ANALIZAR DOGE" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_approval_symbol_resolves_latest_pending(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_latest_trade_approval",
+            lambda **kwargs: {
+                "approval_id": "TRADE-123",
+                "status": "pending",
+                "symbol": "DOGEUSDT",
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "5.25",
+                    "mode": "live",
+                    "order_type": "MARKET",
+                    "stop_loss_pct": "0.5",
+                    "take_profit_pct": "1",
+                    "leverage": "1",
+                    "verifier_model": "doge-scout-v1",
+                    "verifier_passed": True,
+                    "verifier_confidence": "0.88",
+                },
+            },
+        )
+        record_approval = MagicMock(
+            return_value={
+                "approval_id": "TRADE-123",
+                "status": "approved",
+                "evidence_id": "EVID-123",
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "5.25",
+                    "mode": "live",
+                    "order_type": "MARKET",
+                    "stop_loss_pct": "0.5",
+                    "take_profit_pct": "1",
+                    "leverage": "1",
+                    "verifier_model": "doge-scout-v1",
+                    "verifier_passed": True,
+                    "verifier_confidence": "0.88",
+                },
+            }
+        )
+        monkeypatch.setattr(guarded, "record_trade_approval", record_approval)
+        monkeypatch.setattr(
+            guarded,
+            "_submit_trade_result",
+            lambda **kwargs: {
+                "success": True,
+                "execution_mode": "live",
+                "approval": {"approval_id": "TRADE-123"},
+                "decision": {
+                    "proposal": {
+                        "symbol": "DOGEUSDT",
+                        "side": "BUY",
+                        "notional_usd": "5.25",
+                        "leverage": "1",
+                    }
+                },
+                "execution": {
+                    "quantity": "50",
+                    "entry_order": {
+                        "avgPrice": "0.1036",
+                        "executedQty": "50",
+                        "status": "FILLED",
+                        "updateTime": 1779268200000,
+                    },
+                    "protective_orders": {
+                        "stop_loss_price": "0.1031",
+                        "take_profit_price": "0.1046",
+                    },
+                },
+            },
+        )
+
+        send = await send_and_capture(adapter, "APROBAR DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Live ejecutado BUY DOGEUSDT | TRADE-123" in response_text
+        assert "esperar radar 15m" in response_text
+        record_approval.assert_called_once()
+        assert record_approval.call_args.args[0] == "TRADE-123"
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_approval_in_group_stays_plain_text(self, adapter, runner, platform):
+        runner._handle_message_with_agent = AsyncMock(return_value="agent-handled")
+
+        send = await send_and_capture(
+            adapter,
+            "APROBAR TRADE-123",
+            platform,
+            chat_id="group-chat-1",
+            user_id="u1",
+            chat_type="group",
+        )
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert response_text == "agent-handled"
+        runner._handle_message_with_agent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_adjustment_symbol_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "_adjust_live_trade_protection_result",
+            lambda **kwargs: {
+                "success": True,
+                "symbol": "DOGEUSDT",
+                "management": {
+                    "symbol": "DOGEUSDT",
+                    "approval_id": "TRADE-123",
+                    "market_price": "0.10080",
+                    "unrealized_pnl_usd": "0.40",
+                    "unrealized_pnl_pct": "0.80",
+                    "current_stop_price": "0.09950",
+                    "current_take_profit_price": "0.10100",
+                    "recommended_stop_price": "0.10020",
+                    "recommended_take_profit_price": "0.10120",
+                    "summary": "subir SL para asegurar buena parte del beneficio",
+                },
+            },
+        )
+
+        send = await send_and_capture(adapter, "AJUSTAR DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Ajuste live DOGEUSDT | TRADE-123" in response_text
+        assert "esperar radar 15m" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_premium_analysis_symbol_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "_resolve_doge_premium_analysis_request",
+            lambda **kwargs: {
+                "success": True,
+                "premium_outcome": "passed",
+                "symbol": "DOGEUSDT",
+                "request": {
+                    "status": "completed",
+                    "symbol": "DOGEUSDT",
+                    "request_kind": "adjustment",
+                    "model": "gemini-3.5-flash",
+                    "material_payload": {
+                        "position": {"approval_id": "TRADE-123", "market_price": "0.10080"},
+                        "adjustment_context": {
+                            "summary": "subir SL para asegurar beneficio",
+                            "current_stop_price": "0.09950",
+                            "current_take_profit_price": "0.10100",
+                            "suggested_stop_price": "0.10020",
+                            "suggested_take_profit_price": "0.10120",
+                            "unrealized_pnl_usd": "0.40",
+                            "unrealized_pnl_pct": "0.80",
+                            "high_risk": True,
+                            "high_risk_reason": "amplia el riesgo real",
+                        },
+                    },
+                },
+                "assessment": {
+                    "confidence": "0.86",
+                    "summary": "Gemini 3.5 Flash valida el ajuste.",
+                    "risk_flags": ["volatilidad alta"],
+                    "operator_note": "vigilar ejecucion",
+                    "risk_label": "alto_riesgo",
+                },
+            },
+        )
+
+        send = await send_and_capture(adapter, "ANALIZAR DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Gemini 3.5 Flash valida el ajuste" in response_text
+        assert "AJUSTAR DOGE" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_premium_rejection_symbol_falls_back_to_lite_flow(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "_resolve_doge_premium_analysis_request",
+            lambda **kwargs: {
+                "success": True,
+                "premium_outcome": "denied_fallback",
+                "symbol": "DOGEUSDT",
+                "request": {
+                    "status": "denied",
+                    "symbol": "DOGEUSDT",
+                    "request_kind": "entry",
+                    "model": "gemini-3.5-flash",
+                    "material_payload": {},
+                },
+                "trade_approval": {
+                    "approval_id": "TRADE-999",
+                    "expires_at": "2026-05-20T07:00:00+00:00",
+                    "proposal": {
+                        "symbol": "DOGEUSDT",
+                        "side": "BUY",
+                        "notional_usd": "5.25",
+                        "stop_loss_pct": "0.5",
+                        "take_profit_pct": "1.0",
+                    },
+                },
+            },
+        )
+
+        send = await send_and_capture(adapter, "RECHAZAR ANALISIS DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Gemini 3.1 Flash Lite" in response_text
+        assert "Aprobacion requerida TRADE-999" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_personality_lists_options(self, adapter, platform):
         send = await send_and_capture(adapter, "/personality", platform)
 
