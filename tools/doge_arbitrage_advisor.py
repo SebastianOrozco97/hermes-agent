@@ -17,7 +17,8 @@ def plan_delta_neutral_arbitrage(
     available_capital_usd: Decimal,
     market_price: Decimal,
     funding_rate: Decimal,
-    leverage: Decimal = Decimal("5")
+    leverage: Decimal = Decimal("5"),
+    min_funding_threshold: Decimal = Decimal("0.0010") # 0.10% threshold as calibration
 ) -> ArbitragePlan:
     if available_capital_usd <= 0 or market_price <= 0:
         raise ValueError("Capital and market price must be positive.")
@@ -39,7 +40,7 @@ def plan_delta_neutral_arbitrage(
     notional_futures = true_futures_margin * leverage
     futures_quantity = notional_futures / market_price
     
-    action = "enter_arbitrage" if funding_rate > Decimal("0.0001") else "hold"
+    action = "enter_arbitrage" if funding_rate >= min_funding_threshold else "hold"
     rationale = f"Funding rate is {funding_rate}. Spot notional: {true_spot_capital}, Futures notional: {notional_futures}."
     
     return ArbitragePlan(

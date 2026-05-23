@@ -237,3 +237,17 @@ def analyze_doge_15m_signal(
         rationale=rationale,
         market_summary=market_summary,
     )
+def _atr(candles: Sequence[Candle], period: int = 14) -> Decimal:
+    if len(candles) <= period:
+        return Decimal("0")
+    trs = []
+    for i in range(1, len(candles)):
+        c = candles[i]
+        pc = candles[i-1]
+        hl = abs(c.high - c.low)
+        hc = abs(c.high - pc.close)
+        lc = abs(c.low - pc.close)
+        trs.append(max(hl, hc, lc))
+    # Simple Moving Average of True Range to represent Average True Range
+    recent_trs = trs[-period:]
+    return _mean(recent_trs)

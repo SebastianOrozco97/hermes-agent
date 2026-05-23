@@ -23,6 +23,14 @@ from tools.binance_live_adapter import (
     BinanceFuturesLiveExecutor,
     BinanceLiveExecutionError,
 )
+from tools.execution_orchestrators import execute_arbitrage, execute_grid
+from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
+from tools.doge_grid_advisor import plan_dynamic_grid
+
+from tools.execution_orchestrators import execute_arbitrage, execute_grid
+from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
+from tools.doge_grid_advisor import plan_dynamic_grid
+
 from tools.binance_guardrails import (
     BinanceAccountSnapshot,
     BinanceRiskLimits,
@@ -1980,7 +1988,125 @@ def _build_server():
             indent=2,
         )
 
+
+    @mcp.tool()
+    def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 5, notify_whatsapp: bool = True) -> str:
+        """Executes a Phase 2 delta-neutral arbitrage (Spots & Futures). Use when Scout advises an Arbitrage."""
+        try:
+            plan = plan_delta_neutral_arbitrage(
+                symbol=symbol,
+                available_capital_usd=Decimal(str(capital_usd)),
+                market_price=Decimal(str(market_price)),
+                funding_rate=Decimal(str(funding_rate)),
+                leverage=Decimal(str(leverage))
+            )
+            result = execute_arbitrage(plan, dry_run=dry_run)
+            
+            if notify_whatsapp and result.get("success"):
+                if dry_run:
+                    msg = "🧪 SIMULACION FASE 2 ARBITRAJE EXITOSA\nPar: " + symbol + "\nSpot Buy: " + str(result.get('spot_buy_qty')) + "\nTransf: " + str(result.get('transfer_amount')) + "\nFutures Sell: " + str(result.get('futures_short_qty'))
+                else:
+                    msg = "✅ ENTRAMOS A ARBITRAJE DELTA NEUTRAL\nPar: " + symbol + "\nYield Esperado > 0.10%\nAcciones:\n- Spot (Leg 1) COMPRADO\n- Universal Transfer EFECTUADO\n- Futures (Leg 2) SHORTEADO"
+                _send_whatsapp_home_message(msg)
+            elif notify_whatsapp and not result.get("success"):
+                _send_whatsapp_home_message("FAIL: FALLO FASE 2 ARBITRAJE " + symbol + "\nError: " + str(result.get('error')))
+                
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            msg = "FAIL: ERROR INTERNO FASE 2 ARBITRAJE " + symbol + ": " + str(e)
+            if notify_whatsapp: _send_whatsapp_home_message(msg)
+            return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+    @mcp.tool()
+    def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, notify_whatsapp: bool = True) -> str:
+        """Executes a Phase 3 dynamic ATR-based grid. Use when Scout advises a Grid."""
+        try:
+            plan = plan_dynamic_grid(
+                symbol=symbol,
+                market_price=Decimal(str(market_price)),
+                atr=Decimal(str(atr)),
+                available_capital=Decimal(str(capital_usd)),
+                grids_per_side=grids_per_side,
+                atr_multiplier=Decimal("1.5")
+            )
+            result = execute_grid(plan, dry_run=dry_run)
+            
+            if notify_whatsapp and result.get("success"):
+                if dry_run:
+                    msg = "🧪 SIMULACION FASE 3 GRID EXITOSA\nPar: " + symbol + "\nOrdenes Calculadas: " + str(len(plan.levels))
+                else:
+                    msg = "✅ GRID DINAMICA DESPLEGADA\nPar: " + symbol + "\nOrdenes Generadas: " + str(result.get('orders_placed')) + "\nCapital Asignado: " + str(capital_usd) + " USD\nATR Registrado: " + str(atr)
+                _send_whatsapp_home_message(msg)
+            elif notify_whatsapp and not result.get("success"):
+                _send_whatsapp_home_message("FAIL: FALLO FASE 3 GRID " + symbol + "\nError: " + str(result.get('error')))
+
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            msg = "FAIL: ERROR INTERNO FASE 3 GRID " + symbol + ": " + str(e)
+            if notify_whatsapp: _send_whatsapp_home_message(msg)
+            return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+    @mcp.tool()
+    def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 5, notify_whatsapp: bool = True) -> str:
+        """Executes a Phase 2 delta-neutral arbitrage (Spots & Futures). Use when Scout advises an Arbitrage."""
+        try:
+            plan = plan_delta_neutral_arbitrage(
+                symbol=symbol,
+                available_capital_usd=Decimal(str(capital_usd)),
+                market_price=Decimal(str(market_price)),
+                funding_rate=Decimal(str(funding_rate)),
+                leverage=Decimal(str(leverage))
+            )
+            result = execute_arbitrage(plan, dry_run=dry_run)
+            
+            if notify_whatsapp and result.get("success"):
+                if dry_run:
+                    msg = "🧪 SIMULACION FASE 2 ARBITRAJE EXITOSA\nPar: " + symbol + "\nSpot Buy: " + str(result.get('spot_buy_qty')) + "\nTransf: " + str(result.get('transfer_amount')) + "\nFutures Sell: " + str(result.get('futures_short_qty'))
+                else:
+                    msg = "✅ ENTRAMOS A ARBITRAJE DELTA NEUTRAL\nPar: " + symbol + "\nYield Esperado > 0.10%\nAcciones:\n- Spot (Leg 1) COMPRADO\n- Universal Transfer EFECTUADO\n- Futures (Leg 2) SHORTEADO"
+                _send_whatsapp_home_message(msg)
+            elif notify_whatsapp and not result.get("success"):
+                _send_whatsapp_home_message("FAIL: FALLO FASE 2 ARBITRAJE " + symbol + "\nError: " + str(result.get('error')))
+                
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            msg = "FAIL: ERROR INTERNO FASE 2 ARBITRAJE " + symbol + ": " + str(e)
+            if notify_whatsapp: _send_whatsapp_home_message(msg)
+            return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+    @mcp.tool()
+    def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, notify_whatsapp: bool = True) -> str:
+        """Executes a Phase 3 dynamic ATR-based grid. Use when Scout advises a Grid."""
+        try:
+            plan = plan_dynamic_grid(
+                symbol=symbol,
+                market_price=Decimal(str(market_price)),
+                atr=Decimal(str(atr)),
+                available_capital=Decimal(str(capital_usd)),
+                grids_per_side=grids_per_side,
+                atr_multiplier=Decimal("1.5")
+            )
+            result = execute_grid(plan, dry_run=dry_run)
+            
+            if notify_whatsapp and result.get("success"):
+                if dry_run:
+                    msg = "🧪 SIMULACION FASE 3 GRID EXITOSA\nPar: " + symbol + "\nOrdenes Calculadas: " + str(len(plan.levels))
+                else:
+                    msg = "✅ GRID DINAMICA DESPLEGADA\nPar: " + symbol + "\nOrdenes Generadas: " + str(result.get('orders_placed')) + "\nCapital Asignado: " + str(capital_usd) + " USD\nATR Registrado: " + str(atr)
+                _send_whatsapp_home_message(msg)
+            elif notify_whatsapp and not result.get("success"):
+                _send_whatsapp_home_message("FAIL: FALLO FASE 3 GRID " + symbol + "\nError: " + str(result.get('error')))
+
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            msg = "FAIL: ERROR INTERNO FASE 3 GRID " + symbol + ": " + str(e)
+            if notify_whatsapp: _send_whatsapp_home_message(msg)
+            return json.dumps({"success": False, "error": str(e)}, indent=2)
+
     return mcp
+
+
 
 
 def main(argv: Optional[list[str]] = None) -> int:

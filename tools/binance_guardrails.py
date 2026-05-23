@@ -206,9 +206,7 @@ class BinanceTradeProposal:
     verifier_passed: bool = False
     verifier_confidence: Optional[Decimal] = None
     dry_run: bool = True
-    macro_alignment: str = "aligned" 
-    macro_alignment: str = "aligned" 
-    macro_alignment: str = "aligned" 
+    macro_alignment: str = "aligned"
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "BinanceTradeProposal":
@@ -241,9 +239,7 @@ class BinanceTradeProposal:
             verifier_confidence=_parse_optional_decimal(payload.get("verifier_confidence"), "verifier_confidence"),
             dry_run=_parse_bool(payload.get("dry_run"), default=True),
             macro_alignment=str(payload.get("macro_alignment", "aligned")).strip().lower(),
-            macro_alignment=str(payload.get("macro_alignment", "aligned")).strip().lower(),
-            macro_alignment=str(payload.get("macro_alignment", "aligned")).strip().lower(),
-        )
+)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -261,9 +257,7 @@ class BinanceTradeProposal:
             "verifier_confidence": _decimal_to_str(self.verifier_confidence),
             "dry_run": self.dry_run,
             "macro_alignment": self.macro_alignment,
-            "macro_alignment": self.macro_alignment,
-            "macro_alignment": self.macro_alignment,
-        }
+}
 
 
 @dataclass(frozen=True)

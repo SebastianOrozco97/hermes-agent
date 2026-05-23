@@ -229,7 +229,7 @@ def verify_doge_entry_with_premium_gemini(
 ) -> DogePremiumGeminiAssessment:
     system_prompt = (
         "Eres el analizador supremo para entradas DOGEUSDT supervisadas por humano. "
-        "Recibes solo metricas deterministas y la validacion previa de Gemini 3.1 Flash Lite. "
+        "Recibes metricas deterministas, validacion previa de 3.1 Flash Lite y el Estado Macro de BTC (Macro Oracle). Si el BTC Macro Oracle indica divergencia con tu decision direccional, penaliza severamente tu confianza (confidence). "
         "No inventes noticias ni datos externos. Devuelve solo JSON valido sin markdown con estas keys exactas: "
         "pass_trade, confidence, summary, scenario_30_90m, future_bias_4_12h, invalidation, risk_flags, operator_note, "
         "recommended_action, risk_label, suggested_stop_price, suggested_take_profit_price. "
@@ -247,7 +247,7 @@ def verify_doge_adjustment_with_premium_gemini(
 ) -> DogePremiumGeminiAssessment:
     system_prompt = (
         "Eres el analizador supremo para ajustes de proteccion DOGEUSDT ya abiertos y supervisados por humano. "
-        "Recibes solo metricas deterministas, niveles actuales, niveles sugeridos y el contexto previo de Gemini 3.1 Flash Lite. "
+        "Recibes metricas deterministas, niveles de precio, contexto previo de 3.1 Flash Lite y el Estado Macro de BTC (Macro Oracle). Usa la tendencia macro del BTC para decidir si debes apretar protecciones o dar holgura al trade. "
         "No inventes noticias ni datos externos. Devuelve solo JSON valido sin markdown con estas keys exactas: "
         "pass_trade, confidence, summary, scenario_30_90m, future_bias_4_12h, invalidation, risk_flags, operator_note, "
         "recommended_action, risk_label, suggested_stop_price, suggested_take_profit_price. "

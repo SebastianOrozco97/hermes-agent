@@ -816,3 +816,236 @@ class BinanceFuturesLiveExecutor:
             "protective_orders": protective_orders,
             "rollback_result": rollback_result,
         }
+# ==========================================
+# Spot Executor for Phase 2 Arbitrage
+# ==========================================
+
+_SPOT_DEFAULT_BASE_URL = "https://api.binance.com"
+
+class BinanceSpotLiveExecutor:
+    """
+    Adapter for Binance Spot and Universal Transfers.
+    Crucial for Phase 2: Delta Neutral Arbitrage (requires buying in Spot and moving liquidity).
+    """
+    def __init__(
+        self,
+        *,
+        base_url: str = _SPOT_DEFAULT_BASE_URL,
+        api_key: str = "",
+        api_secret: str = "",
+        timeout_s: float = 20.0,
+        recv_window_ms: int = 5000,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key.strip()
+        self.api_secret = api_secret.strip()
+        self.timeout_s = timeout_s
+        self.recv_window_ms = recv_window_ms
+        self._session = requests.Session()
+        self._session.headers.update({"Accept": "application/json"})
+
+    @classmethod
+    def from_env(cls, *, require_credentials: bool = True) -> "BinanceSpotLiveExecutor":
+        api_key = str(os.getenv("BINANCE_API_KEY") or "").strip()
+        api_secret = str(os.getenv("BINANCE_API_SECRET") or "").strip()
+        if require_credentials and not (api_key and api_secret):
+            raise BinanceLiveExecutionError(
+                "Binance live adapter requires BINANCE_API_KEY and BINANCE_API_SECRET"
+            )
+        return cls(api_key=api_key, api_secret=api_secret)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        signed: bool = False,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        req_params = dict(params) if params else {}
+
+        if signed:
+            if not self.api_key or not self.api_secret:
+                raise BinanceLiveExecutionError("Credentials required for signed spot request")
+            req_params["timestamp"] = int(time.time() * 1000)
+            req_params["recvWindow"] = self.recv_window_ms
+            query_string = urllib.parse.urlencode(req_params, doseq=True)
+            signature = hmac.new(
+                self.api_secret.encode("utf-8"),
+                query_string.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            req_params["signature"] = signature
+            self._session.headers.update({"X-MBX-APIKEY": self.api_key})
+
+        try:
+            resp = self._session.request(
+                method, url, params=req_params, timeout=self.timeout_s
+            )
+            data = resp.json()
+        except requests.RequestException as exc:
+            raise BinanceLiveExecutionError(f"Spot Network error: {exc}") from exc
+        except ValueError as exc:
+            raise BinanceLiveExecutionError(f"Invalid JSON from Spot Binance: {exc}") from exc
+
+        if not str(resp.status_code).startswith("2"):
+            code = data.get("code")
+            msg = data.get("msg")
+            raise BinanceLiveExecutionError(f"Spot API Error {code}: {msg}")
+
+        return data
+
+    def get_reference_price(self, symbol: str) -> Decimal:
+        normalized_symbol = str(symbol).strip().upper()
+        res = self._request("GET", "/api/v3/ticker/price", params={"symbol": normalized_symbol})
+        return Decimal(str(res.get("price", "0")))
+
+    def place_market_order(self, symbol: str, side: str, quantity: Decimal) -> dict[str, Any]:
+        params = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": format(quantity.normalize(), "f"),
+        }
+        res = self._request("POST", "/api/v3/order", params=params, signed=True)
+        return res
+
+    def universal_transfer(self, asset: str, amount: Decimal, from_type: str, to_type: str) -> dict[str, Any]:
+        res = self._request(
+            "POST",
+            "/sapi/v1/asset/universalTransfer",
+            params={
+                "asset": asset.strip().upper(),
+                "amount": format(amount.normalize(), "f"),
+                "fromAccountType": from_type,
+                "toAccountType": to_type,
+            },
+            signed=True,
+        )
+        return res
+
+    def fetch_free_balance(self, asset: str = "USDT") -> Decimal:
+        res = self._request("GET", "/api/v3/account", signed=True)
+        for bal in res.get("balances", []):
+            if bal.get("asset") == asset.upper():
+                return Decimal(str(bal.get("free", "0")))
+        return Decimal("0")
+
+
+# ==========================================
+# Spot Executor for Phase 2 Arbitrage
+# ==========================================
+
+_SPOT_DEFAULT_BASE_URL = "https://api.binance.com"
+
+class BinanceSpotLiveExecutor:
+    """
+    Adapter for Binance Spot and Universal Transfers.
+    Crucial for Phase 2: Delta Neutral Arbitrage (requires buying in Spot and moving liquidity).
+    """
+    def __init__(
+        self,
+        *,
+        base_url: str = _SPOT_DEFAULT_BASE_URL,
+        api_key: str = "",
+        api_secret: str = "",
+        timeout_s: float = 20.0,
+        recv_window_ms: int = 5000,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key.strip()
+        self.api_secret = api_secret.strip()
+        self.timeout_s = timeout_s
+        self.recv_window_ms = recv_window_ms
+        self._session = requests.Session()
+        self._session.headers.update({"Accept": "application/json"})
+
+    @classmethod
+    def from_env(cls, *, require_credentials: bool = True) -> "BinanceSpotLiveExecutor":
+        api_key = str(os.getenv("BINANCE_API_KEY") or "").strip()
+        api_secret = str(os.getenv("BINANCE_API_SECRET") or "").strip()
+        if require_credentials and not (api_key and api_secret):
+            raise BinanceLiveExecutionError(
+                "Binance live adapter requires BINANCE_API_KEY and BINANCE_API_SECRET"
+            )
+        return cls(api_key=api_key, api_secret=api_secret)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        signed: bool = False,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        req_params = dict(params) if params else {}
+
+        if signed:
+            if not self.api_key or not self.api_secret:
+                raise BinanceLiveExecutionError("Credentials required for signed spot request")
+            req_params["timestamp"] = int(time.time() * 1000)
+            req_params["recvWindow"] = self.recv_window_ms
+            query_string = urllib.parse.urlencode(req_params, doseq=True)
+            signature = hmac.new(
+                self.api_secret.encode("utf-8"),
+                query_string.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            req_params["signature"] = signature
+            self._session.headers.update({"X-MBX-APIKEY": self.api_key})
+
+        try:
+            resp = self._session.request(
+                method, url, params=req_params, timeout=self.timeout_s
+            )
+            data = resp.json()
+        except requests.RequestException as exc:
+            raise BinanceLiveExecutionError(f"Spot Network error: {exc}") from exc
+        except ValueError as exc:
+            raise BinanceLiveExecutionError(f"Invalid JSON from Spot Binance: {exc}") from exc
+
+        if not str(resp.status_code).startswith("2"):
+            code = data.get("code")
+            msg = data.get("msg")
+            raise BinanceLiveExecutionError(f"Spot API Error {code}: {msg}")
+
+        return data
+
+    def get_reference_price(self, symbol: str) -> Decimal:
+        normalized_symbol = str(symbol).strip().upper()
+        res = self._request("GET", "/api/v3/ticker/price", params={"symbol": normalized_symbol})
+        return Decimal(str(res.get("price", "0")))
+
+    def place_market_order(self, symbol: str, side: str, quantity: Decimal) -> dict[str, Any]:
+        params = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": format(quantity.normalize(), "f"),
+        }
+        res = self._request("POST", "/api/v3/order", params=params, signed=True)
+        return res
+
+    def universal_transfer(self, asset: str, amount: Decimal, from_type: str, to_type: str) -> dict[str, Any]:
+        res = self._request(
+            "POST",
+            "/sapi/v1/asset/universalTransfer",
+            params={
+                "asset": asset.strip().upper(),
+                "amount": format(amount.normalize(), "f"),
+                "fromAccountType": from_type,
+                "toAccountType": to_type,
+            },
+            signed=True,
+        )
+        return res
+
+    def fetch_free_balance(self, asset: str = "USDT") -> Decimal:
+        res = self._request("GET", "/api/v3/account", signed=True)
+        for bal in res.get("balances", []):
+            if bal.get("asset") == asset.upper():
+                return Decimal(str(bal.get("free", "0")))
+        return Decimal("0")
+
