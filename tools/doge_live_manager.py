@@ -7,7 +7,7 @@ from typing import Any, Mapping, Optional
 from tools.binance_live_adapter import BinanceFuturesLiveExecutor
 from tools.binance_paper_runtime import get_latest_trade_approval
 from tools.doge_signal_engine import analyze_doge_15m_signal, parse_binance_klines
-from tools.doge_trade_advisor import DogeTradeManagementPlan, plan_doge_long_management
+from tools.doge_trade_advisor import DogeTradeManagementPlan, plan_doge_management
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -152,7 +152,8 @@ def build_doge_live_management_snapshot(
     entry_side = _entry_side_from_position(resolved_position)
     stop_loss_pct = _decimal(proposal.get("stop_loss_pct"), str(default_stop_loss_pct))
     take_profit_pct = _decimal(proposal.get("take_profit_pct"), str(default_take_profit_pct))
-    plan = plan_doge_long_management(
+    plan = plan_doge_management(
+        entry_side=entry_side,
         entry_price=entry_price,
         market_price=market_price,
         quantity=quantity,

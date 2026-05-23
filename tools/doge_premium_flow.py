@@ -34,6 +34,7 @@ def build_doge_entry_premium_payload(
     gemini_lite_assessment: Mapping[str, Any] | None,
     proposal_payload: Mapping[str, Any],
     evidence_id: str,
+    macro_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "event_kind": "entry",
@@ -57,10 +58,13 @@ def build_doge_entry_premium_payload(
         "gemini_lite_assessment": dict(gemini_lite_assessment or {}),
         "proposal_payload": dict(proposal_payload or {}),
         "evidence_id": str(evidence_id or "").strip().upper(),
+        "macro_state": dict(macro_state or {}),
+        "macro_state": dict(macro_state or {}),
+        "macro_state": dict(macro_state or {}),
     }
 
 
-def build_doge_adjustment_premium_payload(snapshot: Any, *, timeframe: str) -> dict[str, Any]:
+def build_doge_adjustment_premium_payload(snapshot: Any, *, timeframe: str, macro_state: Mapping[str, Any] | None = None) -> dict[str, Any]:
     current_stop_price = ""
     current_take_profit_price = ""
     if snapshot.protective_orders.get("stop_loss"):
@@ -113,6 +117,9 @@ def build_doge_adjustment_premium_payload(snapshot: Any, *, timeframe: str) -> d
             "higher_timeframe_total": int(snapshot.plan.higher_timeframe_total),
             "high_risk": high_risk,
             "high_risk_reason": high_risk_reason,
+            "macro_state": dict(macro_state or {}),
+            "macro_state": dict(macro_state or {}),
+            "macro_state": dict(macro_state or {}),
         },
     }
 

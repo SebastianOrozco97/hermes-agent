@@ -392,7 +392,28 @@ def _build_doge_premium_request_whatsapp_message(request: dict[str, Any]) -> str
     symbol = str(request.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
     kind_label = premium_request_kind_label(request_kind)
     model_label = _premium_model_display_name(str(request.get("model") or ""))
-    lines = [f"Analisis premium pendiente {symbol} | {kind_label} | {model_label}"]
+    
+    # 4. Transformacion de Salida hacia WhatsApp - Semaforo Macro
+    macro_state = material_payload.get("macro_state") or {}
+    macro_semaphore = ""
+    if macro_state:
+        btc_trend = macro_state.get("btc_trend_1h", "neutral")
+        side = "BUY"
+        if request_kind == "entry":
+            proposal = material_payload.get("proposal_payload") or {}
+            side = str(proposal.get("side") or "BUY").strip().upper()
+        if side == "BUY" and btc_trend == "bullish":
+            macro_semaphore = " ?? MACRO ALINEADO (BTC impulsando)"
+        elif side == "SELL" and btc_trend == "bearish":
+            macro_semaphore = " ?? MACRO ALINEADO (BTC impulsando bajada)"
+        elif side == "BUY" and btc_trend == "bearish":
+            macro_semaphore = " ?? MACRO OPUESTO (BTC arrastre bajista)"
+        elif side == "SELL" and btc_trend == "bullish":
+            macro_semaphore = " ?? MACRO OPUESTO (BTC divergencia alcista)"
+        else:
+            macro_semaphore = " ?? MACRO NEUTRAL / LATERAL"
+            
+    lines = [f"Analisis premium pendiente {symbol} | {kind_label} | {model_label}{macro_semaphore}"]
     if request_kind == "entry":
         base_summary = str(request.get("material_summary") or material_payload.get("market_summary") or "").strip()
         if base_summary:

@@ -206,6 +206,9 @@ class BinanceTradeProposal:
     verifier_passed: bool = False
     verifier_confidence: Optional[Decimal] = None
     dry_run: bool = True
+    macro_alignment: str = "aligned" 
+    macro_alignment: str = "aligned" 
+    macro_alignment: str = "aligned" 
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "BinanceTradeProposal":
@@ -237,6 +240,9 @@ class BinanceTradeProposal:
             verifier_passed=_parse_bool(payload.get("verifier_passed"), default=False),
             verifier_confidence=_parse_optional_decimal(payload.get("verifier_confidence"), "verifier_confidence"),
             dry_run=_parse_bool(payload.get("dry_run"), default=True),
+            macro_alignment=str(payload.get("macro_alignment", "aligned")).strip().lower(),
+            macro_alignment=str(payload.get("macro_alignment", "aligned")).strip().lower(),
+            macro_alignment=str(payload.get("macro_alignment", "aligned")).strip().lower(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -254,6 +260,9 @@ class BinanceTradeProposal:
             "verifier_passed": self.verifier_passed,
             "verifier_confidence": _decimal_to_str(self.verifier_confidence),
             "dry_run": self.dry_run,
+            "macro_alignment": self.macro_alignment,
+            "macro_alignment": self.macro_alignment,
+            "macro_alignment": self.macro_alignment,
         }
 
 
@@ -327,9 +336,14 @@ def evaluate_trade_proposal(
         reasons.append("live trading is disabled in the active risk profile")
     if proposal.notional_usd <= 0:
         reasons.append("notional_usd must be greater than zero")
-    if proposal.notional_usd > limits.max_notional_usd:
+    # Dynamic macro sizing check
+    effective_max_notional = limits.max_notional_usd
+    if proposal.macro_alignment == "divergent":
+        effective_max_notional = limits.max_notional_usd * Decimal("0.5")  # Risk Slash 50%
+        
+    if proposal.notional_usd > effective_max_notional:
         reasons.append(
-            f"notional_usd {proposal.notional_usd} exceeds max_notional_usd {limits.max_notional_usd}"
+            f"notional_usd {proposal.notional_usd} exceeds effective_max_notional {effective_max_notional} (Macro Alignment: {proposal.macro_alignment})"
         )
     if proposal.leverage <= 0:
         reasons.append("leverage must be greater than zero")
