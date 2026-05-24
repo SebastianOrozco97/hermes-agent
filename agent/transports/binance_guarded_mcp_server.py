@@ -1992,6 +1992,7 @@ def _build_server():
     @mcp.tool()
     def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 5, notify_whatsapp: bool = True) -> str:
         """Executes a Phase 2 delta-neutral arbitrage (Spots & Futures). Use when Scout advises an Arbitrage."""
+        _ensure_runtime_env_loaded()
         try:
             plan = plan_delta_neutral_arbitrage(
                 symbol=symbol,
@@ -2020,6 +2021,7 @@ def _build_server():
     @mcp.tool()
     def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, notify_whatsapp: bool = True) -> str:
         """Executes a Phase 3 dynamic ATR-based grid. Use when Scout advises a Grid."""
+        _ensure_runtime_env_loaded()
         try:
             plan = plan_dynamic_grid(
                 symbol=symbol,
@@ -2050,6 +2052,7 @@ def _build_server():
     @mcp.tool()
     def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 5, notify_whatsapp: bool = True) -> str:
         """Executes a Phase 2 delta-neutral arbitrage (Spots & Futures). Use when Scout advises an Arbitrage."""
+        _ensure_runtime_env_loaded()
         try:
             plan = plan_delta_neutral_arbitrage(
                 symbol=symbol,
@@ -2078,6 +2081,7 @@ def _build_server():
     @mcp.tool()
     def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, notify_whatsapp: bool = True) -> str:
         """Executes a Phase 3 dynamic ATR-based grid. Use when Scout advises a Grid."""
+        _ensure_runtime_env_loaded()
         try:
             plan = plan_dynamic_grid(
                 symbol=symbol,

@@ -86,10 +86,14 @@ def execute_grid(plan: GridPlan, dry_run: bool = False) -> dict[str, Any]:
     try:
         for lvl in plan.levels:
             rules = futures_executor._get_symbol_rules(plan.symbol)
-            qty_clean = futures_executor._quantize_to_step(lvl.quantity, rules.step_size, rounding="ROUND_DOWN")
-            price_clean = futures_executor._quantize_to_step(lvl.price, rules.tick_size, rounding="ROUND_HALF_UP")
+            
+            # Use the global _quantize_to_step function from binance_live_adapter
+            from tools.binance_live_adapter import _quantize_to_step
+            qty_clean = _quantize_to_step(lvl.quantity, rules.quantity_step, rounding="down")
+            price_clean = _quantize_to_step(lvl.price, rules.price_tick, rounding="up")
 
-            if qty_clean < rules.min_qty or qty_clean * price_clean < rules.min_notional:
+            # min_qty is not defined in SymbolTradingRules, skip min_quantity check or we only check > 0
+            if qty_clean <= 0 or qty_clean * price_clean < rules.min_notional:
                 continue 
 
             order = futures_executor._request(
