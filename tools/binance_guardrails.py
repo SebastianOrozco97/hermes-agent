@@ -27,6 +27,11 @@ _DEFAULT_VERIFIER_ALLOWLIST = (
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash",
 )
+_DEFAULT_STRATEGY_MAX_LEVERAGE = {
+    "trade": Decimal("1"),
+    "arbitrage": Decimal("2"),
+    "grid": Decimal("1"),
+}
 
 
 def _parse_decimal(value: Any, field_name: str) -> Decimal:
@@ -83,6 +88,24 @@ def _decimal_to_str(value: Optional[Decimal]) -> Optional[str]:
     if value is None:
         return None
     return format(value.normalize(), "f") if value != value.to_integral() else str(value.quantize(Decimal("1")))
+
+
+def get_strategy_leverage_cap(
+    strategy: str,
+    env: Optional[Mapping[str, Any]] = None,
+) -> Decimal:
+    env_map = env or os.environ
+    normalized = str(strategy or "trade").strip().lower() or "trade"
+    if normalized not in _DEFAULT_STRATEGY_MAX_LEVERAGE:
+        normalized = "trade"
+
+    env_key = f"BINANCE_RISK_{normalized.upper()}_MAX_LEVERAGE"
+    fallback = (
+        env_map.get("BINANCE_RISK_MAX_LEVERAGE", "1")
+        if normalized == "trade"
+        else str(_DEFAULT_STRATEGY_MAX_LEVERAGE[normalized])
+    )
+    return _parse_decimal(env_map.get(env_key, fallback), env_key)
 
 
 def get_kill_switch_path(home: Optional[Path] = None) -> Path:
@@ -335,6 +358,9 @@ def evaluate_trade_proposal(
     if proposal.macro_alignment == "divergent":
         effective_max_notional = limits.max_notional_usd * Decimal("0.5")  # Risk Slash 50%
         
+    if proposal.macro_alignment == "blocked":
+        reasons.append("macro alignment blocks new entries")
+
     if proposal.notional_usd > effective_max_notional:
         reasons.append(
             f"notional_usd {proposal.notional_usd} exceeds effective_max_notional {effective_max_notional} (Macro Alignment: {proposal.macro_alignment})"

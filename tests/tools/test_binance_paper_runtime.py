@@ -11,12 +11,16 @@ from tools.binance_paper_runtime import (
     get_paper_daily_summary,
     get_paper_account_overview,
     get_paper_journal_path,
+    get_paper_strategy_history,
+    get_paper_strategy_history_summary,
     get_latest_trade_approval,
     get_paper_position_status,
     open_paper_position,
     reconcile_protective_exits,
     record_doge_premium_analysis_decision,
     record_live_trade_execution_failure,
+    record_live_trade_execution_success,
+    record_live_trade_protection_adjustment,
     record_market_evidence,
     request_doge_premium_analysis,
     request_trade_approval,
@@ -43,6 +47,47 @@ def _proposal(**overrides):
     }
     payload.update(overrides)
     return BinanceTradeProposal.from_payload(payload)
+
+
+def _decision_context(
+    *,
+    strategy_id: str,
+    regime_tags: tuple[str, ...],
+    macro_alignment: str = "aligned",
+    risk_level: str = "normal",
+    btc_trend_1h: str = "bullish",
+    btc_trend_4h: str = "bullish",
+):
+    return {
+        "selector_family": "doge_meta_selector_v1",
+        "selected_strategy_id": strategy_id,
+        "selected_strategy": {
+            "strategy_id": strategy_id,
+            "expected_edge": "0.82",
+            "confidence": "0.79",
+            "capital_required_usd": "20",
+            "holding_horizon": "30-90m",
+            "macro_alignment": macro_alignment,
+            "regime_tags": list(regime_tags),
+        },
+        "alternatives_considered": [],
+        "macro_state": {
+            "risk_level": risk_level,
+            "btc_trend_1h": btc_trend_1h,
+            "btc_trend_4h": btc_trend_4h,
+        },
+        "market_context": {},
+    }
+
+
+def _rewrite_closed_at(home, position_id: str, closed_at: str) -> None:
+    path = get_paper_journal_path(home=home)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for row in rows:
+        if row.get("event_type") == "paper_position_closed" and row.get("position_id") == position_id:
+            row["closed_at"] = closed_at
+            break
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
 
 def test_seed_paper_account_sets_persistent_balance(tmp_path):
@@ -139,7 +184,7 @@ def test_get_latest_trade_approval_returns_most_recent_match(tmp_path):
         _proposal(symbol="DOGEUSDT", notional_usd="21"),
         home=tmp_path,
     )
-    request_trade_approval(_proposal(symbol="BTCUSDT", notional_usd="40"), home=tmp_path)
+    request_trade_approval(_proposal(symbol="SOLUSDT", notional_usd="40"), home=tmp_path)
 
     lookup_pending = get_latest_trade_approval(symbol="DOGEUSDT", status="pending", home=tmp_path)
     lookup_latest = get_latest_trade_approval(symbol="DOGEUSDT", home=tmp_path)
@@ -245,6 +290,98 @@ def test_record_live_trade_execution_failure_appends_structured_journal_event(tm
     assert payload["details"] == {"evidence_id": "EVID-123"}
 
 
+def test_record_live_trade_execution_success_appends_structured_journal_event(tmp_path):
+    record = record_live_trade_execution_success(
+        proposal=_proposal(symbol="DOGEUSDT", mode="live", notional_usd="5.25"),
+        execution={"entry_order": {"symbol": "DOGEUSDT", "status": "FILLED"}},
+        approval_id="TRADE-LIVE123",
+        evidence_id="EVID-123",
+        decision_context={"selected_strategy": {"strategy_id": "overlay_tactical_long"}},
+        home=tmp_path,
+    )
+
+    journal_lines = get_paper_journal_path(home=tmp_path).read_text(encoding="utf-8").splitlines()
+    payload = json.loads(journal_lines[-1])
+
+    assert record["event_type"] == "live_trade_executed"
+    assert payload["event_type"] == "live_trade_executed"
+    assert payload["approval_id"] == "TRADE-LIVE123"
+    assert payload["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
+
+
+def test_record_live_trade_protection_adjustment_appends_structured_journal_event(tmp_path):
+    record = record_live_trade_protection_adjustment(
+        symbol="DOGEUSDT",
+        approval_id="TRADE-ADJ123",
+        management={"action": "trail_profit", "summary": "subir SL"},
+        adjustment={"new_orders": {"stop_loss_price": "0.10020"}},
+        decision_context={"selected_strategy": {"strategy_id": "overlay_tactical_long"}},
+        home=tmp_path,
+    )
+
+    journal_lines = get_paper_journal_path(home=tmp_path).read_text(encoding="utf-8").splitlines()
+    payload = json.loads(journal_lines[-1])
+
+    assert record["event_type"] == "live_trade_protection_adjusted"
+    assert payload["event_type"] == "live_trade_protection_adjusted"
+    assert payload["approval_id"] == "TRADE-ADJ123"
+    assert payload["management"]["action"] == "trail_profit"
+    assert payload["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
+
+
+def test_trade_approval_persists_decision_context_on_record_and_journal(tmp_path):
+    decision_context = {
+        "selected_strategy": {
+            "strategy_id": "overlay_tactical_long",
+            "expected_edge": "0.86",
+            "holding_horizon": "30-90m",
+        },
+        "alternatives_considered": [
+            {"strategy_id": "atr_grid", "rejection_reason": "trend regime blocks the grid"},
+            {"strategy_id": "funding_arbitrage", "rejection_reason": "funding below threshold"},
+        ],
+        "macro_state": {"risk_level": "normal"},
+        "verifier_assessments": {"gemini_lite": {"passed": True, "confidence": "0.81"}},
+    }
+
+    approval = request_trade_approval(
+        _proposal(symbol="DOGEUSDT", notional_usd="5.25"),
+        decision_context=decision_context,
+        home=tmp_path,
+    )
+
+    journal_lines = get_paper_journal_path(home=tmp_path).read_text(encoding="utf-8").splitlines()
+    payload = json.loads(journal_lines[-1])
+
+    assert approval["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
+    assert payload["event_type"] == "trade_approval_requested"
+    assert payload["decision_context"]["alternatives_considered"][0]["strategy_id"] == "atr_grid"
+    assert payload["decision_context"]["verifier_assessments"]["gemini_lite"]["confidence"] == "0.81"
+
+
+def test_open_paper_position_persists_decision_context_in_state_and_journal(tmp_path):
+    decision_context = {
+        "selected_strategy": {"strategy_id": "overlay_tactical_long"},
+        "alternatives_considered": [{"strategy_id": "atr_grid"}],
+        "macro_state": {"risk_level": "normal"},
+    }
+
+    opened = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="5.25"),
+        reference_price=Decimal("0.1043"),
+        approval_id="TRADE-CTX123",
+        decision_context=decision_context,
+        home=tmp_path,
+    )
+
+    journal_lines = get_paper_journal_path(home=tmp_path).read_text(encoding="utf-8").splitlines()
+    payload = json.loads(journal_lines[-1])
+
+    assert opened["position"]["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
+    assert payload["event_type"] == "paper_position_opened"
+    assert payload["decision_context"]["alternatives_considered"][0]["strategy_id"] == "atr_grid"
+
+
 def test_reconcile_protective_exits_closes_take_profit_and_updates_balance(tmp_path):
     seed_paper_account(Decimal("1000"), reset=True, home=tmp_path)
     evidence = record_market_evidence(
@@ -271,6 +408,9 @@ def test_reconcile_protective_exits_closes_take_profit_and_updates_balance(tmp_p
 
     assert len(reconciled["closed_positions"]) == 1
     assert reconciled["closed_positions"][0]["trigger"] == "take_profit"
+    assert reconciled["closed_positions"][0]["trigger_category"] == "protective_exit"
+    assert reconciled["closed_positions"][0]["thesis_outcome"] == "validated"
+    assert reconciled["closed_positions"][0]["management_context"]["reconciler"] == "protective_exit"
     assert overview["account_snapshot"]["open_positions"] == 0
     assert overview["cash_balance_usd"] == "1001"
 
@@ -314,6 +454,10 @@ def test_position_status_reports_open_and_closed_snapshots(tmp_path):
     assert closed_status["trigger"] == "take_profit"
     assert closed_status["realized_pnl_usd"] == closed["realized_pnl_usd"]
     assert closed_status["reason"] == "take profit reached"
+    assert closed_status["trigger_category"] == "protective_exit"
+    assert closed_status["thesis_outcome"] == "validated"
+    assert closed_status["failure_mode"] == "none"
+    assert closed_status["expected_vs_realized"]["exit_trigger"] == "take_profit"
 
 
 def test_daily_summary_reports_entries_exits_and_pnl(tmp_path):
@@ -344,3 +488,158 @@ def test_daily_summary_reports_entries_exits_and_pnl(tmp_path):
     assert summary["approvals_denied"] == 0
     assert summary["open_positions_count"] == 0
     assert summary["realized_pnl_usd"] == "0.2"
+    assert summary["exits"][0]["thesis_outcome"] == "managed_profit"
+    assert summary["strategy_scorecard"]["total_matches"] == 1
+
+
+def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp_path):
+    seed_paper_account(Decimal("1000"), reset=True, home=tmp_path)
+
+    bullish_overlay = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id="TRADE-BULL",
+        decision_context=_decision_context(
+            strategy_id="overlay_tactical_long",
+            regime_tags=("directional_overlay", "breakout_pressure", "trend_supportive"),
+            btc_trend_1h="bullish",
+            btc_trend_4h="bullish",
+        ),
+        home=tmp_path,
+    )
+    bullish_closed = close_paper_position(
+        bullish_overlay["position"]["position_id"],
+        exit_price=Decimal("0.105343"),
+        reason="take profit reached",
+        trigger="take_profit",
+        thesis_outcome="validated",
+        home=tmp_path,
+    )
+
+    bearish_overlay = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id="TRADE-BEAR",
+        decision_context=_decision_context(
+            strategy_id="overlay_tactical_long",
+            regime_tags=("directional_overlay", "breakout_pressure"),
+            macro_alignment="cautious",
+            risk_level="elevated",
+            btc_trend_1h="bearish",
+            btc_trend_4h="bearish",
+        ),
+        home=tmp_path,
+    )
+    bearish_closed = close_paper_position(
+        bearish_overlay["position"]["position_id"],
+        exit_price=Decimal("0.103000"),
+        reason="stop after breakdown",
+        trigger="stop_loss",
+        thesis_outcome="invalidated",
+        home=tmp_path,
+    )
+
+    grid_position = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id="TRADE-GRID",
+        decision_context=_decision_context(
+            strategy_id="atr_grid",
+            regime_tags=("range_capture", "range_bound"),
+            btc_trend_1h="flat",
+            btc_trend_4h="flat",
+        ),
+        home=tmp_path,
+    )
+    close_paper_position(
+        grid_position["position"]["position_id"],
+        exit_price=Decimal("0.105000"),
+        reason="range scalp",
+        trigger="manual",
+        thesis_outcome="managed_profit",
+        home=tmp_path,
+    )
+
+    today = bullish_closed["closed_at"][:10]
+    yesterday = "2026-05-27"
+    _rewrite_closed_at(tmp_path, bearish_overlay["position"]["position_id"], f"{yesterday}T12:00:00+00:00")
+
+    bullish_history = get_paper_strategy_history(
+        symbol="DOGEUSDT",
+        strategy_id="overlay_tactical_long",
+        regime="bullish_macro",
+        outcome="validated",
+        start_date=today,
+        end_date=today,
+        home=tmp_path,
+    )
+    bearish_history = get_paper_strategy_history(
+        symbol="DOGEUSDT",
+        strategy_id="overlay_tactical_long",
+        regime="bearish_macro",
+        outcome="invalidated",
+        start_date=yesterday,
+        end_date=yesterday,
+        home=tmp_path,
+    )
+
+    assert bullish_history["total_matches"] == 1
+    assert bullish_history["records"][0]["position_id"] == bullish_overlay["position"]["position_id"]
+    assert bullish_history["records"][0]["primary_regime"] == "breakout_pressure"
+    assert bearish_history["total_matches"] == 1
+    assert bearish_history["records"][0]["position_id"] == bearish_overlay["position"]["position_id"]
+    assert "bearish_macro" in bearish_history["records"][0]["regime_labels"]
+
+
+def test_get_paper_strategy_history_summary_groups_by_strategy_and_regime(tmp_path):
+    seed_paper_account(Decimal("1000"), reset=True, home=tmp_path)
+
+    overlay = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id="TRADE-OVERLAY",
+        decision_context=_decision_context(
+            strategy_id="overlay_tactical_long",
+            regime_tags=("directional_overlay", "breakout_pressure", "trend_supportive"),
+        ),
+        home=tmp_path,
+    )
+    close_paper_position(
+        overlay["position"]["position_id"],
+        exit_price=Decimal("0.105343"),
+        reason="take profit reached",
+        trigger="take_profit",
+        thesis_outcome="validated",
+        home=tmp_path,
+    )
+
+    grid = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id="TRADE-GRID2",
+        decision_context=_decision_context(
+            strategy_id="atr_grid",
+            regime_tags=("range_capture", "range_bound"),
+            btc_trend_1h="flat",
+            btc_trend_4h="flat",
+        ),
+        home=tmp_path,
+    )
+    close_paper_position(
+        grid["position"]["position_id"],
+        exit_price=Decimal("0.104000"),
+        reason="range failed",
+        trigger="manual",
+        thesis_outcome="managed_loss",
+        home=tmp_path,
+    )
+
+    summary = get_paper_strategy_history_summary(symbol="DOGEUSDT", home=tmp_path)
+
+    assert summary["total_matches"] == 2
+    overlay_summary = next(item for item in summary["strategies"] if item["strategy_id"] == "overlay_tactical_long")
+    grid_summary = next(item for item in summary["strategies"] if item["strategy_id"] == "atr_grid")
+    assert overlay_summary["wins"] == 1
+    assert overlay_summary["regimes"][0]["regime_label"] == "breakout_pressure"
+    assert grid_summary["losses"] == 1
+    assert any(item["regime_label"] == "range_bound" for item in summary["regimes"])

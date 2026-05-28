@@ -20,7 +20,7 @@ WORKDIR /tmp/hermes-agent
 COPY . /tmp/hermes-agent
 
 RUN pip install --no-cache-dir \
-        ".[messaging,pty,mcp,cli,cron,google,homeassistant,sms,web,acp,youtube]" \
+    ".[messaging,pty,mcp,cli,cron,google,homeassistant,sms,web,acp,youtube,dev]" \
     && npm --prefix /tmp/hermes-agent/scripts/whatsapp-bridge install --omit=dev \
     && npm cache clean --force
 

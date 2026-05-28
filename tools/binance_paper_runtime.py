@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
 import hashlib
@@ -159,6 +159,27 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload) + "\n")
 
 
+def _normalize_json_payload(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return _decimal_to_str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _normalize_json_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_json_payload(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _normalize_decision_context(value: Any) -> Optional[dict[str, Any]]:
+    if value in (None, ""):
+        return None
+    normalized = _normalize_json_payload(value)
+    if not isinstance(normalized, dict):
+        raise ValueError("decision_context must be a mapping when provided")
+    return normalized
+
+
 def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -292,6 +313,7 @@ class PaperPosition:
     approval_id: Optional[str]
     evidence_id: Optional[str]
     opened_at: str
+    decision_context: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "PaperPosition":
@@ -311,6 +333,7 @@ class PaperPosition:
             approval_id=str(payload.get("approval_id", "") or "").strip() or None,
             evidence_id=str(payload.get("evidence_id", "") or "").strip() or None,
             opened_at=str(payload.get("opened_at", "") or "").strip() or _now_iso(),
+            decision_context=_normalize_decision_context(payload.get("decision_context")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -330,6 +353,7 @@ class PaperPosition:
             "approval_id": self.approval_id,
             "evidence_id": self.evidence_id,
             "opened_at": self.opened_at,
+            "decision_context": self.decision_context,
         }
 
 
@@ -367,6 +391,116 @@ def _pnl_pct_from_notional(*, pnl_usd: Decimal, notional_usd: Decimal) -> Option
     return _decimal_to_str((pnl_usd / notional_usd) * Decimal("100"))
 
 
+def _trigger_category(trigger: str, reason: str = "") -> str:
+    normalized_trigger = str(trigger or "").strip().lower()
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_trigger in {"stop_loss", "take_profit"}:
+        return "protective_exit"
+    if "breakout" in normalized_trigger or "breakout" in normalized_reason:
+        return "breakout_exit"
+    if normalized_trigger in {"manual", "close_command", "operator"}:
+        return "manual_exit"
+    return normalized_trigger or "unknown"
+
+
+def _derive_exit_attribution(
+    *,
+    position: PaperPosition,
+    realized_pnl_usd: Decimal,
+    trigger: str,
+    reason: str,
+    risk: Mapping[str, Any],
+    duration: Mapping[str, Any],
+    thesis_outcome: str = "",
+    failure_mode: str = "",
+) -> dict[str, Any]:
+    normalized_trigger = str(trigger or "manual").strip().lower() or "manual"
+    normalized_reason = str(reason or "").strip().lower()
+    trigger_category = _trigger_category(normalized_trigger, normalized_reason)
+
+    resolved_thesis_outcome = str(thesis_outcome or "").strip().lower()
+    if not resolved_thesis_outcome:
+        if normalized_trigger == "take_profit" and realized_pnl_usd > 0:
+            resolved_thesis_outcome = "validated"
+        elif normalized_trigger == "stop_loss" and realized_pnl_usd < 0:
+            resolved_thesis_outcome = "invalidated"
+        elif trigger_category == "breakout_exit":
+            resolved_thesis_outcome = "regime_shift_exit"
+        elif realized_pnl_usd > 0:
+            resolved_thesis_outcome = "managed_profit"
+        elif realized_pnl_usd < 0:
+            resolved_thesis_outcome = "managed_loss"
+        else:
+            resolved_thesis_outcome = "flat_exit"
+
+    resolved_failure_mode = str(failure_mode or "").strip().lower()
+    if not resolved_failure_mode:
+        if any(keyword in normalized_reason for keyword in ("execution", "slippage", "latency")):
+            resolved_failure_mode = "execution_degradation"
+        elif normalized_trigger == "stop_loss":
+            resolved_failure_mode = "thesis_failure"
+        elif trigger_category == "breakout_exit":
+            resolved_failure_mode = "regime_breakout"
+        elif trigger_category == "manual_exit" and realized_pnl_usd < 0:
+            resolved_failure_mode = "operator_override"
+        elif normalized_trigger == "take_profit":
+            resolved_failure_mode = "none"
+        else:
+            resolved_failure_mode = "managed_exit"
+
+    thesis_outcome_tags: list[str] = []
+    if resolved_thesis_outcome == "validated":
+        thesis_outcome_tags.extend(["thesis_worked", "target_hit"])
+    elif resolved_thesis_outcome == "invalidated":
+        thesis_outcome_tags.extend(["thesis_failed", "stop_loss_hit"])
+    elif resolved_thesis_outcome == "regime_shift_exit":
+        thesis_outcome_tags.extend(["regime_shift", "breakout_exit"])
+    elif resolved_thesis_outcome == "managed_profit":
+        thesis_outcome_tags.extend(["managed_exit", "profit_locked"])
+    elif resolved_thesis_outcome == "managed_loss":
+        thesis_outcome_tags.extend(["managed_exit", "loss_capped"])
+    else:
+        thesis_outcome_tags.append(resolved_thesis_outcome)
+
+    if trigger_category not in thesis_outcome_tags:
+        thesis_outcome_tags.append(trigger_category)
+    if resolved_failure_mode == "execution_degradation" and "execution_degraded" not in thesis_outcome_tags:
+        thesis_outcome_tags.append("execution_degraded")
+
+    attribution_bucket = "strategy"
+    if resolved_failure_mode == "execution_degradation":
+        attribution_bucket = "execution"
+    elif trigger_category in {"protective_exit", "manual_exit", "breakout_exit"}:
+        attribution_bucket = "management"
+
+    selected_strategy = dict(position.decision_context.get("selected_strategy") or {}) if position.decision_context else {}
+    expected_vs_realized = {
+        "selected_strategy_id": str(selected_strategy.get("strategy_id") or "").strip() or None,
+        "expected_edge": selected_strategy.get("expected_edge"),
+        "expected_holding_horizon": selected_strategy.get("holding_horizon"),
+        "expected_max_profit_usd": risk.get("estimated_max_profit_usd"),
+        "expected_max_loss_usd": risk.get("estimated_max_loss_usd"),
+        "realized_pnl_usd": _decimal_to_str(realized_pnl_usd),
+        "realized_pnl_pct": _pnl_pct_from_notional(
+            pnl_usd=realized_pnl_usd,
+            notional_usd=position.notional_usd,
+        ),
+        "realized_duration_seconds": duration.get("duration_seconds"),
+        "realized_duration_human": duration.get("duration_human"),
+        "exit_trigger": normalized_trigger,
+        "trigger_category": trigger_category,
+    }
+
+    return {
+        "trigger_category": trigger_category,
+        "thesis_outcome": resolved_thesis_outcome,
+        "thesis_outcome_tags": thesis_outcome_tags,
+        "failure_mode": resolved_failure_mode,
+        "attribution_bucket": attribution_bucket,
+        "expected_vs_realized": expected_vs_realized,
+    }
+
+
 def _position_status_payload(
     position: PaperPosition,
     *,
@@ -377,6 +511,14 @@ def _position_status_payload(
     closed_at: str = "",
     trigger: str = "",
     reason: str = "",
+    trigger_category: str = "",
+    thesis_outcome: str = "",
+    thesis_outcome_tags: Optional[Sequence[str]] = None,
+    failure_mode: str = "",
+    attribution_bucket: str = "",
+    expected_vs_realized: Optional[Mapping[str, Any]] = None,
+    management_context: Optional[Mapping[str, Any]] = None,
+    execution_context: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "status": status,
@@ -415,6 +557,22 @@ def _position_status_payload(
         payload["trigger"] = trigger
     if reason:
         payload["reason"] = reason
+    if trigger_category:
+        payload["trigger_category"] = trigger_category
+    if thesis_outcome:
+        payload["thesis_outcome"] = thesis_outcome
+    if thesis_outcome_tags:
+        payload["thesis_outcome_tags"] = list(thesis_outcome_tags)
+    if failure_mode:
+        payload["failure_mode"] = failure_mode
+    if attribution_bucket:
+        payload["attribution_bucket"] = attribution_bucket
+    if expected_vs_realized:
+        payload["expected_vs_realized"] = dict(expected_vs_realized)
+    if management_context:
+        payload["management_context"] = dict(management_context)
+    if execution_context:
+        payload["execution_context"] = dict(execution_context)
     return payload
 
 
@@ -435,6 +593,427 @@ def _daily_realized_pnl_usd(home: Optional[Path] = None) -> Decimal:
             continue
         total += _parse_decimal(event.get("realized_pnl_usd", "0"), "realized_pnl_usd")
     return total
+
+
+def _normalize_history_label(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    pieces: list[str] = []
+    pending_separator = False
+    for character in text:
+        if character.isalnum():
+            if pending_separator and pieces:
+                pieces.append("_")
+            pieces.append(character)
+            pending_separator = False
+        else:
+            pending_separator = True
+    return "".join(pieces).strip("_")
+
+
+def _unique_history_labels(values: Sequence[Any]) -> list[str]:
+    labels: list[str] = []
+    for raw_value in values:
+        label = _normalize_history_label(raw_value)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _parse_history_boundary(value: str, *, end: bool = False) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = _parse_iso_datetime(text)
+    if parsed is None:
+        suffix = "T23:59:59.999999+00:00" if end else "T00:00:00+00:00"
+        parsed = _parse_iso_datetime(text + suffix)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    if "T" not in text and " " not in text:
+        if end:
+            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            parsed = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+    return parsed
+
+
+def _history_event_timestamp(event: Mapping[str, Any]) -> Optional[datetime]:
+    for key in ("closed_at", "opened_at", "recorded_at", "created_at"):
+        parsed = _parse_iso_datetime(str(event.get(key, "") or "").strip())
+        if parsed is None:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _macro_direction_label(value: str) -> str:
+    normalized = _normalize_history_label(value)
+    if not normalized:
+        return ""
+    if "bear" in normalized:
+        return "bearish"
+    if "bull" in normalized:
+        return "bullish"
+    return normalized
+
+
+def _derive_strategy_regime_labels(decision_context: Mapping[str, Any]) -> tuple[list[str], str]:
+    selected_strategy = decision_context.get("selected_strategy") or {}
+    if not isinstance(selected_strategy, Mapping):
+        selected_strategy = {}
+    market_context = decision_context.get("market_context") or {}
+    if not isinstance(market_context, Mapping):
+        market_context = {}
+    macro_state = decision_context.get("macro_state") or {}
+    if not isinstance(macro_state, Mapping):
+        macro_state = {}
+
+    strategy_regime_tags = _unique_history_labels(selected_strategy.get("regime_tags") or ())
+    market_regime_tags = _unique_history_labels(market_context.get("regime_tags") or ())
+    regime_labels = list(strategy_regime_tags)
+    for label in market_regime_tags:
+        if label not in regime_labels:
+            regime_labels.append(label)
+
+    macro_alignment = _normalize_history_label(selected_strategy.get("macro_alignment"))
+    if macro_alignment:
+        label = f"macro_{macro_alignment}"
+        if label not in regime_labels:
+            regime_labels.append(label)
+
+    risk_level = _normalize_history_label(macro_state.get("risk_level"))
+    if risk_level:
+        label = f"risk_{risk_level}"
+        if label not in regime_labels:
+            regime_labels.append(label)
+
+    trend_1h = _normalize_history_label(macro_state.get("btc_trend_1h"))
+    trend_4h = _normalize_history_label(macro_state.get("btc_trend_4h"))
+    if trend_1h:
+        label = f"btc_1h_{trend_1h}"
+        if label not in regime_labels:
+            regime_labels.append(label)
+    if trend_4h:
+        label = f"btc_4h_{trend_4h}"
+        if label not in regime_labels:
+            regime_labels.append(label)
+
+    macro_direction_1h = _macro_direction_label(trend_1h)
+    macro_direction_4h = _macro_direction_label(trend_4h)
+    if macro_direction_1h and macro_direction_1h == macro_direction_4h:
+        macro_direction_label = f"{macro_direction_1h}_macro"
+        if macro_direction_label not in regime_labels:
+            regime_labels.append(macro_direction_label)
+    elif macro_direction_1h and macro_direction_4h and macro_direction_1h != macro_direction_4h:
+        if "mixed_macro" not in regime_labels:
+            regime_labels.append("mixed_macro")
+
+    primary_regime = "unknown"
+    preferred_strategy_tags = [
+        label
+        for label in strategy_regime_tags
+        if label not in {"directional_overlay", "range_capture", "delta_neutral"}
+        and not label.endswith("m")
+    ]
+    if preferred_strategy_tags:
+        primary_regime = preferred_strategy_tags[0]
+    elif strategy_regime_tags:
+        primary_regime = strategy_regime_tags[0]
+    elif "bearish_macro" in regime_labels:
+        primary_regime = "bearish_macro"
+    elif "bullish_macro" in regime_labels:
+        primary_regime = "bullish_macro"
+    elif macro_alignment:
+        primary_regime = f"macro_{macro_alignment}"
+    elif market_regime_tags:
+        primary_regime = market_regime_tags[0]
+
+    return regime_labels, primary_regime
+
+
+def _strategy_history_record(event: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    if event.get("event_type") != "paper_position_closed":
+        return None
+    timestamp = _history_event_timestamp(event)
+    if timestamp is None:
+        return None
+
+    raw_decision_context = event.get("decision_context") or {}
+    if not isinstance(raw_decision_context, Mapping):
+        raw_decision_context = {}
+    decision_context = _normalize_decision_context(raw_decision_context) or {}
+    selected_strategy = decision_context.get("selected_strategy") or {}
+    if not isinstance(selected_strategy, Mapping):
+        selected_strategy = {}
+
+    strategy_id = str(
+        selected_strategy.get("strategy_id")
+        or decision_context.get("selected_strategy_id")
+        or "unknown"
+    ).strip().lower() or "unknown"
+    regime_labels, primary_regime = _derive_strategy_regime_labels(decision_context)
+    thesis_outcome = str(event.get("thesis_outcome", "") or "").strip().lower()
+    outcome_labels = _unique_history_labels([thesis_outcome, *(event.get("thesis_outcome_tags") or ())])
+
+    return {
+        "position_id": str(event.get("position_id", "") or "").strip(),
+        "symbol": str(event.get("symbol", "") or "").strip().upper(),
+        "strategy_id": strategy_id,
+        "primary_regime": primary_regime,
+        "regime_labels": regime_labels,
+        "macro_alignment": str(selected_strategy.get("macro_alignment", "") or "").strip().lower(),
+        "holding_horizon": str(selected_strategy.get("holding_horizon", "") or "").strip(),
+        "expected_edge": str(selected_strategy.get("expected_edge", "") or "").strip(),
+        "selection_confidence": str(selected_strategy.get("confidence", "") or "").strip(),
+        "selector_family": str(decision_context.get("selector_family", "") or "").strip(),
+        "opened_at": str(event.get("opened_at", "") or "").strip(),
+        "closed_at": str(event.get("closed_at", "") or "").strip(),
+        "realized_pnl_usd": str(event.get("realized_pnl_usd", "0") or "0").strip(),
+        "realized_pnl_pct": str(event.get("realized_pnl_pct", "") or "").strip(),
+        "trigger": str(event.get("trigger", "") or "").strip(),
+        "trigger_category": str(event.get("trigger_category", "") or "").strip(),
+        "thesis_outcome": thesis_outcome,
+        "thesis_outcome_tags": list(event.get("thesis_outcome_tags") or ()),
+        "failure_mode": str(event.get("failure_mode", "") or "").strip(),
+        "attribution_bucket": str(event.get("attribution_bucket", "") or "").strip(),
+        "expected_vs_realized": dict(event.get("expected_vs_realized") or {}),
+        "decision_context": dict(decision_context),
+        "_event_timestamp": timestamp,
+        "_normalized_strategy_id": _normalize_history_label(strategy_id),
+        "_normalized_regime_labels": _unique_history_labels(regime_labels),
+        "_normalized_outcome_labels": outcome_labels,
+    }
+
+
+def get_paper_strategy_history(
+    *,
+    symbol: str = "",
+    strategy_id: str = "",
+    regime: str = "",
+    outcome: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_strategy_id = _normalize_history_label(strategy_id)
+    normalized_regime = _normalize_history_label(regime)
+    normalized_outcome = _normalize_history_label(outcome)
+    start_boundary = _parse_history_boundary(start_date, end=False)
+    end_boundary = _parse_history_boundary(end_date, end=True)
+
+    records: list[dict[str, Any]] = []
+    total_realized_pnl = Decimal("0")
+    for event in _iter_jsonl(get_paper_journal_path(home=home)):
+        record = _strategy_history_record(event)
+        if record is None:
+            continue
+        if normalized_symbol and record["symbol"] != normalized_symbol:
+            continue
+        if normalized_strategy_id and record["_normalized_strategy_id"] != normalized_strategy_id:
+            continue
+        if normalized_regime and normalized_regime not in record["_normalized_regime_labels"]:
+            continue
+        if normalized_outcome and normalized_outcome not in record["_normalized_outcome_labels"]:
+            continue
+
+        timestamp = record["_event_timestamp"]
+        if start_boundary is not None and timestamp < start_boundary:
+            continue
+        if end_boundary is not None and timestamp > end_boundary:
+            continue
+
+        total_realized_pnl += _parse_decimal(record["realized_pnl_usd"], "realized_pnl_usd")
+        public_record = {key: value for key, value in record.items() if not key.startswith("_")}
+        records.append(public_record)
+
+    records.sort(key=lambda item: str(item.get("closed_at", "") or ""), reverse=True)
+    return {
+        "success": True,
+        "filters": {
+            "symbol": normalized_symbol,
+            "strategy_id": normalized_strategy_id,
+            "regime": normalized_regime,
+            "outcome": normalized_outcome,
+            "start_date": str(start_date or "").strip(),
+            "end_date": str(end_date or "").strip(),
+        },
+        "total_matches": len(records),
+        "total_realized_pnl_usd": _decimal_to_str(total_realized_pnl),
+        "records": records,
+    }
+
+
+def _update_history_bucket(bucket: dict[str, Any], record: Mapping[str, Any]) -> None:
+    pnl = _parse_decimal(record.get("realized_pnl_usd", "0"), "realized_pnl_usd")
+    bucket["closed_positions"] += 1
+    bucket["realized_pnl_usd"] += pnl
+    if pnl > 0:
+        bucket["wins"] += 1
+    elif pnl < 0:
+        bucket["losses"] += 1
+    else:
+        bucket["flat"] += 1
+    outcome = str(record.get("thesis_outcome", "") or "").strip().lower() or "unknown"
+    bucket["outcomes"][outcome] = bucket["outcomes"].get(outcome, 0) + 1
+
+
+def _finalize_history_bucket(
+    key_name: str,
+    key_value: str,
+    bucket: Mapping[str, Any],
+    *,
+    regimes: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    closed_positions = int(bucket.get("closed_positions", 0) or 0)
+    wins = int(bucket.get("wins", 0) or 0)
+    realized_pnl_usd = Decimal(bucket.get("realized_pnl_usd", Decimal("0")))
+    avg_realized_pnl = realized_pnl_usd / Decimal(closed_positions) if closed_positions else Decimal("0")
+    win_rate_pct = Decimal("0")
+    if closed_positions:
+        win_rate_pct = (Decimal(wins) / Decimal(closed_positions)) * Decimal("100")
+    finalized = {
+        key_name: key_value,
+        "closed_positions": closed_positions,
+        "wins": wins,
+        "losses": int(bucket.get("losses", 0) or 0),
+        "flat": int(bucket.get("flat", 0) or 0),
+        "win_rate_pct": _decimal_to_str(win_rate_pct),
+        "realized_pnl_usd": _decimal_to_str(realized_pnl_usd),
+        "avg_realized_pnl_usd": _decimal_to_str(avg_realized_pnl),
+        "outcomes": dict(bucket.get("outcomes", {})),
+    }
+    if regimes is not None:
+        finalized["regimes"] = regimes
+    return finalized
+
+
+def _history_bucket_sort_key(item: Mapping[str, Any], key_name: str) -> tuple[int, Decimal, str]:
+    return (
+        -int(item.get("closed_positions", 0) or 0),
+        -_parse_decimal(item.get("realized_pnl_usd", "0"), "realized_pnl_usd"),
+        str(item.get(key_name, "") or ""),
+    )
+
+
+def get_paper_strategy_history_summary(
+    *,
+    symbol: str = "",
+    strategy_id: str = "",
+    regime: str = "",
+    outcome: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    history = get_paper_strategy_history(
+        symbol=symbol,
+        strategy_id=strategy_id,
+        regime=regime,
+        outcome=outcome,
+        start_date=start_date,
+        end_date=end_date,
+        home=home,
+    )
+
+    total_bucket = {
+        "closed_positions": 0,
+        "wins": 0,
+        "losses": 0,
+        "flat": 0,
+        "realized_pnl_usd": Decimal("0"),
+        "outcomes": {},
+    }
+    strategy_buckets: dict[str, dict[str, Any]] = {}
+    regime_buckets: dict[str, dict[str, Any]] = {}
+
+    for record in history["records"]:
+        _update_history_bucket(total_bucket, record)
+
+        normalized_strategy = str(record.get("strategy_id", "") or "").strip().lower() or "unknown"
+        strategy_bucket = strategy_buckets.setdefault(
+            normalized_strategy,
+            {
+                "closed_positions": 0,
+                "wins": 0,
+                "losses": 0,
+                "flat": 0,
+                "realized_pnl_usd": Decimal("0"),
+                "outcomes": {},
+                "regimes": {},
+            },
+        )
+        _update_history_bucket(strategy_bucket, record)
+
+        primary_regime = str(record.get("primary_regime", "") or "").strip().lower() or "unknown"
+        overall_regime_bucket = regime_buckets.setdefault(
+            primary_regime,
+            {
+                "closed_positions": 0,
+                "wins": 0,
+                "losses": 0,
+                "flat": 0,
+                "realized_pnl_usd": Decimal("0"),
+                "outcomes": {},
+            },
+        )
+        _update_history_bucket(overall_regime_bucket, record)
+
+        per_strategy_regime_bucket = strategy_bucket["regimes"].setdefault(
+            primary_regime,
+            {
+                "closed_positions": 0,
+                "wins": 0,
+                "losses": 0,
+                "flat": 0,
+                "realized_pnl_usd": Decimal("0"),
+                "outcomes": {},
+            },
+        )
+        _update_history_bucket(per_strategy_regime_bucket, record)
+
+    finalized_strategies: list[dict[str, Any]] = []
+    for normalized_strategy, bucket in strategy_buckets.items():
+        finalized_regimes = [
+            _finalize_history_bucket("regime_label", regime_label, regime_bucket)
+            for regime_label, regime_bucket in bucket["regimes"].items()
+        ]
+        finalized_regimes.sort(key=lambda item: _history_bucket_sort_key(item, "regime_label"))
+        finalized_strategies.append(
+            _finalize_history_bucket(
+                "strategy_id",
+                normalized_strategy,
+                bucket,
+                regimes=finalized_regimes,
+            )
+        )
+    finalized_strategies.sort(key=lambda item: _history_bucket_sort_key(item, "strategy_id"))
+
+    finalized_regimes = [
+        _finalize_history_bucket("regime_label", regime_label, bucket)
+        for regime_label, bucket in regime_buckets.items()
+    ]
+    finalized_regimes.sort(key=lambda item: _history_bucket_sort_key(item, "regime_label"))
+
+    summary = _finalize_history_bucket("scope", "overall", total_bucket)
+    summary.update(
+        {
+            "success": True,
+            "filters": dict(history["filters"]),
+            "total_matches": history["total_matches"],
+            "strategies": finalized_strategies,
+            "regimes": finalized_regimes,
+        }
+    )
+    summary.pop("scope", None)
+    return summary
 
 
 def get_paper_daily_summary(summary_date: str = "", *, home: Optional[Path] = None) -> dict[str, Any]:
@@ -471,7 +1050,10 @@ def get_paper_daily_summary(summary_date: str = "", *, home: Optional[Path] = No
                     "closed_at": str(event.get("closed_at", "") or "").strip(),
                     "realized_pnl_usd": _decimal_to_str(pnl),
                     "trigger": str(event.get("trigger", "") or "").strip(),
+                    "trigger_category": str(event.get("trigger_category", "") or "").strip(),
                     "reason": str(event.get("reason", "") or "").strip(),
+                    "thesis_outcome": str(event.get("thesis_outcome", "") or "").strip(),
+                    "failure_mode": str(event.get("failure_mode", "") or "").strip(),
                 }
             )
             continue
@@ -499,6 +1081,11 @@ def get_paper_daily_summary(summary_date: str = "", *, home: Optional[Path] = No
         "open_positions": [position.to_dict() for position in open_positions],
         "entries": entries,
         "exits": exits,
+        "strategy_scorecard": get_paper_strategy_history_summary(
+            start_date=wanted_date,
+            end_date=wanted_date,
+            home=home,
+        ),
     }
 
 
@@ -897,6 +1484,7 @@ def request_trade_approval(
     market_summary: str = "",
     requested_via: str = "whatsapp",
     expires_minutes: int = 0,
+    decision_context: Optional[Mapping[str, Any]] = None,
     home: Optional[Path] = None,
 ) -> dict[str, Any]:
     evidence = None
@@ -911,6 +1499,7 @@ def request_trade_approval(
     approval_store = _load_approvals(home=home)
     ttl = expires_minutes if expires_minutes > 0 else _trade_approval_ttl_minutes()
     approval_id = f"TRADE-{uuid.uuid4().hex[:8].upper()}"
+    normalized_decision_context = _normalize_decision_context(decision_context)
     record = {
         "approval_id": approval_id,
         "created_at": _now_iso(),
@@ -927,6 +1516,7 @@ def request_trade_approval(
         "decision_by": None,
         "decided_at": None,
         "consumed_at": None,
+        "decision_context": normalized_decision_context,
     }
     approval_store.setdefault("approvals", []).append(record)
     _save_approvals(approval_store, home=home)
@@ -939,6 +1529,7 @@ def request_trade_approval(
             "symbol": proposal.symbol,
             "proposal_fingerprint": record["proposal_fingerprint"],
             "evidence_id": record["evidence_id"],
+            "decision_context": normalized_decision_context,
         },
     )
     return record
@@ -952,6 +1543,7 @@ def record_live_trade_execution_failure(
     stage: str = "submit_trade",
     rollback_sent: bool = False,
     details: Optional[dict[str, Any]] = None,
+    decision_context: Optional[Mapping[str, Any]] = None,
     home: Optional[Path] = None,
 ) -> dict[str, Any]:
     record = {
@@ -963,7 +1555,60 @@ def record_live_trade_execution_failure(
         "stage": str(stage or "submit_trade").strip() or "submit_trade",
         "rollback_sent": bool(rollback_sent),
         "error": str(error or "").strip() or "unknown live execution error",
-        "details": details or None,
+        "details": _normalize_json_payload(details) if details else None,
+        "decision_context": _normalize_decision_context(decision_context),
+    }
+    _append_jsonl(get_paper_journal_path(home=home), record)
+    return record
+
+
+def record_live_trade_execution_success(
+    *,
+    proposal: BinanceTradeProposal,
+    execution: Mapping[str, Any],
+    approval_id: str = "",
+    evidence_id: str = "",
+    details: Optional[dict[str, Any]] = None,
+    decision_context: Optional[Mapping[str, Any]] = None,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    record = {
+        "event_type": "live_trade_executed",
+        "recorded_at": _now_iso(),
+        "approval_id": str(approval_id or "").strip().upper() or None,
+        "symbol": proposal.symbol,
+        "proposal_fingerprint": _proposal_fingerprint(proposal),
+        "evidence_id": str(evidence_id or "").strip().upper() or None,
+        "proposal": proposal.to_dict(),
+        "execution": _normalize_json_payload(execution),
+        "details": _normalize_json_payload(details) if details else None,
+        "decision_context": _normalize_decision_context(decision_context),
+    }
+    _append_jsonl(get_paper_journal_path(home=home), record)
+    return record
+
+
+def record_live_trade_protection_adjustment(
+    *,
+    symbol: str,
+    approval_id: str = "",
+    management: Mapping[str, Any],
+    adjustment: Mapping[str, Any],
+    premium_request: Optional[Mapping[str, Any]] = None,
+    premium_assessment: Optional[Mapping[str, Any]] = None,
+    decision_context: Optional[Mapping[str, Any]] = None,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    record = {
+        "event_type": "live_trade_protection_adjusted",
+        "recorded_at": _now_iso(),
+        "symbol": str(symbol or "").strip().upper(),
+        "approval_id": str(approval_id or "").strip().upper() or None,
+        "management": _normalize_json_payload(management),
+        "adjustment": _normalize_json_payload(adjustment),
+        "premium_request_id": str((premium_request or {}).get("request_id") or "").strip() or None,
+        "premium_assessment": _normalize_json_payload(premium_assessment) if premium_assessment else None,
+        "decision_context": _normalize_decision_context(decision_context),
     }
     _append_jsonl(get_paper_journal_path(home=home), record)
     return record
@@ -1118,6 +1763,7 @@ def _build_position(
     reference_price: Decimal,
     approval_id: str = "",
     evidence_id: str = "",
+    decision_context: Optional[Mapping[str, Any]] = None,
 ) -> PaperPosition:
     quantity = proposal.notional_usd / reference_price
     stop_loss_pct = proposal.stop_loss_pct or Decimal("0")
@@ -1144,6 +1790,7 @@ def _build_position(
         approval_id=str(approval_id or "").strip().upper() or None,
         evidence_id=str(evidence_id or "").strip().upper() or None,
         opened_at=_now_iso(),
+        decision_context=_normalize_decision_context(decision_context),
     )
 
 
@@ -1153,6 +1800,7 @@ def open_paper_position(
     reference_price: Decimal,
     approval_id: str = "",
     evidence_id: str = "",
+    decision_context: Optional[Mapping[str, Any]] = None,
     home: Optional[Path] = None,
 ) -> dict[str, Any]:
     state = _load_state(home=home)
@@ -1161,6 +1809,7 @@ def open_paper_position(
         reference_price=reference_price,
         approval_id=approval_id,
         evidence_id=evidence_id,
+        decision_context=decision_context,
     )
     state.setdefault("open_positions", []).append(position.to_dict())
     _save_state(state, home=home)
@@ -1183,6 +1832,7 @@ def open_paper_position(
             "take_profit_price": _decimal_to_str(position.take_profit_price),
             "approval_id": position.approval_id,
             "evidence_id": position.evidence_id,
+            "decision_context": position.decision_context,
         },
     )
     return {
@@ -1267,6 +1917,14 @@ def get_paper_position_status(
                 closed_at=str(record.get("closed_at", "") or "").strip(),
                 trigger=str(record.get("trigger", "") or "").strip(),
                 reason=str(record.get("reason", "") or "").strip(),
+                trigger_category=str(record.get("trigger_category", "") or "").strip(),
+                thesis_outcome=str(record.get("thesis_outcome", "") or "").strip(),
+                thesis_outcome_tags=tuple(record.get("thesis_outcome_tags") or ()),
+                failure_mode=str(record.get("failure_mode", "") or "").strip(),
+                attribution_bucket=str(record.get("attribution_bucket", "") or "").strip(),
+                expected_vs_realized=record.get("expected_vs_realized") or None,
+                management_context=record.get("management_context") or None,
+                execution_context=record.get("execution_context") or None,
             ),
         }
 
@@ -1283,6 +1941,10 @@ def close_paper_position(
     exit_price: Decimal,
     reason: str,
     trigger: str = "manual",
+    thesis_outcome: str = "",
+    failure_mode: str = "",
+    management_context: Optional[Mapping[str, Any]] = None,
+    execution_context: Optional[Mapping[str, Any]] = None,
     home: Optional[Path] = None,
 ) -> dict[str, Any]:
     normalized_id = str(position_id or "").strip().upper()
@@ -1304,6 +1966,16 @@ def close_paper_position(
         overview = get_paper_account_overview(symbol=position.symbol, home=home)
         duration = _duration_snapshot(position.opened_at, closed_at)
         risk = _position_risk_summary(position)
+        attribution = _derive_exit_attribution(
+            position=position,
+            realized_pnl_usd=realized_pnl_usd,
+            trigger=trigger,
+            reason=reason,
+            risk=risk,
+            duration=duration,
+            thesis_outcome=thesis_outcome,
+            failure_mode=failure_mode,
+        )
         record = {
             "event_type": "paper_position_closed",
             "closed_at": closed_at,
@@ -1329,11 +2001,20 @@ def close_paper_position(
             "reason": str(reason or "").strip() or "manual close",
             "approval_id": position.approval_id,
             "evidence_id": position.evidence_id,
+            "decision_context": position.decision_context,
             "duration_seconds": duration["duration_seconds"],
             "duration_human": duration["duration_human"],
             "estimated_max_loss_usd": risk["estimated_max_loss_usd"],
             "estimated_max_profit_usd": risk["estimated_max_profit_usd"],
             "risk_reward_ratio": risk["risk_reward_ratio"],
+            "trigger_category": attribution["trigger_category"],
+            "thesis_outcome": attribution["thesis_outcome"],
+            "thesis_outcome_tags": attribution["thesis_outcome_tags"],
+            "failure_mode": attribution["failure_mode"],
+            "attribution_bucket": attribution["attribution_bucket"],
+            "expected_vs_realized": attribution["expected_vs_realized"],
+            "management_context": _normalize_json_payload(management_context) if management_context else None,
+            "execution_context": _normalize_json_payload(execution_context) if execution_context else None,
         }
         _append_jsonl(get_paper_journal_path(home=home), record)
         return {
@@ -1350,6 +2031,14 @@ def close_paper_position(
             "commands": _follow_up_commands(position),
             "account_snapshot": overview["account_snapshot"],
             "journal_path": overview["journal_path"],
+            "trigger_category": record["trigger_category"],
+            "thesis_outcome": record["thesis_outcome"],
+            "thesis_outcome_tags": list(record["thesis_outcome_tags"]),
+            "failure_mode": record["failure_mode"],
+            "attribution_bucket": record["attribution_bucket"],
+            "expected_vs_realized": dict(record["expected_vs_realized"]),
+            "management_context": record["management_context"],
+            "execution_context": record["execution_context"],
         }
     raise ValueError(f"position_id '{normalized_id}' was not found")
 
@@ -1399,6 +2088,10 @@ def reconcile_protective_exits(
                 exit_price=current_price,
                 reason=f"protective exit triggered via {trigger}",
                 trigger=trigger,
+                management_context={
+                    "reconciler": "protective_exit",
+                    "market_price": _decimal_to_str(current_price),
+                },
                 home=home,
             )
         )

@@ -161,14 +161,15 @@ def analyze_doge_15m_signal(
     previous_ema_fast = ema_fast_series[-2]
     ema_slow = ema_slow_series[-1]
     previous_ema_slow = ema_slow_series[-2]
+    trend_spread_floor = Decimal("0.0002")
 
     close_above_fast = last_close > ema_fast
-    fast_above_slow = ema_fast > ema_slow
+    fast_above_slow = ema_fast >= (ema_slow * (Decimal("1") + trend_spread_floor))
     fast_slope_up = ema_fast > previous_ema_fast
     slow_slope_up = ema_slow >= previous_ema_slow
-    rsi_in_range = Decimal("52") <= rsi_14 <= Decimal("67")
+    rsi_in_range = Decimal("52") <= rsi_14 <= Decimal("75")
     volume_confirmed = volume_ratio >= Decimal("1.10")
-    breakout_confirmed = last_close >= breakout_reference
+    breakout_confirmed = last_close > breakout_reference
 
     signal_score = sum(
         int(flag)
@@ -193,6 +194,8 @@ def analyze_doge_15m_signal(
         and fast_slope_up
         and slow_slope_up
         and rsi_in_range
+        and volume_confirmed
+        and breakout_confirmed
         and signal_score >= score_threshold
     )
 

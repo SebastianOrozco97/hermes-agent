@@ -4,6 +4,8 @@ import os
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 import agent.transports.binance_guarded_mcp_server as guarded
 from tools.binance_live_adapter import BinanceLiveExecutionError
 from tools.binance_paper_runtime import record_market_evidence, request_trade_approval, record_trade_approval
@@ -52,6 +54,29 @@ class _FakeExecutor:
         }
 
 
+class _SerializableSignal(SimpleNamespace):
+    def to_dict(self):
+        payload = {}
+        for key, value in self.__dict__.items():
+            payload[key] = format(value, "f") if isinstance(value, Decimal) else value
+        return payload
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("BINANCE_KILL_SWITCH", raising=False)
+    monkeypatch.setenv("BINANCE_REQUIRE_TRADE_APPROVAL", "false")
+    monkeypatch.setenv("BINANCE_RISK_ALLOWED_SYMBOLS", "BTCUSDT,DOGEUSDT")
+    monkeypatch.setenv("BINANCE_RISK_MAX_NOTIONAL_USD", "250")
+    monkeypatch.setenv("BINANCE_RISK_MIN_FREE_BALANCE_USD", "10")
+    monkeypatch.setenv("BINANCE_RISK_MAX_DAILY_LOSS_USD", "25")
+    monkeypatch.setenv("BINANCE_RISK_MAX_OPEN_POSITIONS", "1")
+    monkeypatch.setenv("BINANCE_RISK_MAX_POSITIONS_PER_SYMBOL", "1")
+    monkeypatch.setenv("BINANCE_RISK_MAX_LEVERAGE", "1")
+    monkeypatch.setenv("BINANCE_RISK_MIN_VERIFIER_CONFIDENCE", "0.75")
+
+
 def test_account_snapshot_result_uses_live_executor(monkeypatch):
     monkeypatch.setattr(guarded, "_get_live_executor", lambda require_credentials=True: _FakeExecutor())
 
@@ -92,6 +117,47 @@ def test_submit_trade_result_live_revalidates_with_exchange_snapshot(monkeypatch
     assert result["execution_mode"] == "live"
     assert executor.submit_calls
     assert result["decision"]["account"]["free_balance_usd"] == "1000"
+
+
+def test_submit_trade_result_live_blocks_blocked_macro_alignment(monkeypatch):
+    executor = _FakeExecutor()
+    monkeypatch.setattr(guarded, "_get_live_executor", lambda require_credentials=True: executor)
+    monkeypatch.setenv("BINANCE_RISK_MODE", "live")
+    monkeypatch.setenv("BINANCE_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("BINANCE_RISK_ALLOWED_SYMBOLS", "DOGEUSDT")
+    monkeypatch.setenv("BINANCE_RISK_MAX_NOTIONAL_USD", "10")
+    monkeypatch.setenv("BINANCE_RISK_MIN_FREE_BALANCE_USD", "10")
+    monkeypatch.setenv("BINANCE_RISK_MAX_DAILY_LOSS_USD", "25")
+    monkeypatch.setenv("BINANCE_RISK_MAX_OPEN_POSITIONS", "1")
+    monkeypatch.setenv("BINANCE_RISK_MAX_POSITIONS_PER_SYMBOL", "1")
+    monkeypatch.setenv("BINANCE_RISK_MAX_LEVERAGE", "1")
+    monkeypatch.setenv("BINANCE_RISK_MIN_VERIFIER_CONFIDENCE", "0.75")
+
+    result = guarded._submit_trade_result(
+        symbol="DOGEUSDT",
+        side="BUY",
+        notional_usd=5,
+        mode="live",
+        order_type="MARKET",
+        stop_loss_pct=0.5,
+        take_profit_pct=1.0,
+        leverage=1.0,
+        free_balance_usd=0.0,
+        open_positions=0,
+        positions_in_symbol=0,
+        daily_realized_pnl_usd=0.0,
+        verifier_model="gemini-3.1-flash-lite",
+        verifier_passed=True,
+        verifier_confidence=0.95,
+        rationale="respect macro blocks",
+        macro_alignment="blocked",
+        dry_run=True,
+    )
+
+    assert result["success"] is False
+    assert result["decision"]["proposal"]["macro_alignment"] == "blocked"
+    assert "macro alignment blocks new entries" in result["decision"]["reasons"]
+    assert not executor.preview_calls
 
 
 def test_submit_trade_result_live_dry_run_uses_exchange_snapshot(monkeypatch):
@@ -262,6 +328,7 @@ def test_submit_trade_result_live_executes_after_approved_live_request(monkeypat
     assert result["success"] is True
     assert result["execution_mode"] == "live"
     assert result["approval"]["status"] == "consumed"
+    assert result["live_execution_event"]["event_type"] == "live_trade_executed"
     assert executor.submit_calls
 
 
@@ -406,6 +473,7 @@ def test_submit_trade_result_paper_opens_position_after_approval(monkeypatch, tm
             }
         ),
         evidence_id=evidence["evidence_id"],
+        decision_context={"selected_strategy": {"strategy_id": "overlay_tactical_long"}},
         home=tmp_path,
     )
     record_trade_approval(approval["approval_id"], decision="approve", home=tmp_path)
@@ -437,6 +505,7 @@ def test_submit_trade_result_paper_opens_position_after_approval(monkeypatch, tm
     assert result["success"] is True
     assert result["execution_mode"] == "paper"
     assert result["paper_position"]["symbol"] == "BTCUSDT"
+    assert result["paper_position"]["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
     assert result["paper_account"]["free_balance_usd"] == "950"
 
 
@@ -734,9 +803,12 @@ def test_adjust_live_trade_protection_result_rearms_live_orders(monkeypatch):
         "build_doge_live_management_snapshot",
         lambda *args, **kwargs: SimpleNamespace(
             symbol="DOGEUSDT",
+            timeframe="15m",
             approval_id="TRADE-123",
+            approval={"approval_id": "TRADE-123", "decision_context": {"selected_strategy": {"strategy_id": "overlay_tactical_long"}}},
             entry_side="BUY",
-            signal=SimpleNamespace(last_close=Decimal("0.10080")),
+            signal=_SerializableSignal(last_close=Decimal("0.10080"), verdict="manage"),
+            contextual_signals={},
             active_position={"entry_price": "0.10000", "side": "LONG"},
             plan=SimpleNamespace(
                 action="trail_profit",
@@ -748,7 +820,13 @@ def test_adjust_live_trade_protection_result_rearms_live_orders(monkeypatch):
                 higher_timeframe_total=2,
             ),
             protective_orders_missing=False,
-            protective_orders={"orders": [{"orderId": 11}, {"orderId": 12}]},
+                protective_orders={
+                    "orders": [{"orderId": 11}, {"orderId": 12}],
+                    "stop_loss": {"orderId": 11},
+                    "take_profit": {"orderId": 12},
+                    "stop_loss_price": "0.09950",
+                    "take_profit_price": "0.10100",
+                },
             current_stop_price=Decimal("0.09950"),
             current_take_profit_price=Decimal("0.10100"),
             recommended_stop_price=Decimal("0.10020"),
@@ -762,6 +840,8 @@ def test_adjust_live_trade_protection_result_rearms_live_orders(monkeypatch):
     assert result["success"] is True
     assert executor.adjust_calls
     assert executor.adjust_calls[0][0] == "DOGEUSDT"
+    assert result["adjustment_event"]["event_type"] == "live_trade_protection_adjusted"
+    assert result["adjustment_event"]["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
     message = guarded._build_live_adjustment_whatsapp_message(result)
     assert "Ajuste live DOGEUSDT | TRADE-123" in message
     assert "SL 0.099500 -> 0.100200" in message

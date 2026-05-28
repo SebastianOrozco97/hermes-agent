@@ -35,6 +35,7 @@ def build_doge_entry_premium_payload(
     proposal_payload: Mapping[str, Any],
     evidence_id: str,
     macro_state: Mapping[str, Any] | None = None,
+    decision_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "event_kind": "entry",
@@ -59,8 +60,7 @@ def build_doge_entry_premium_payload(
         "proposal_payload": dict(proposal_payload or {}),
         "evidence_id": str(evidence_id or "").strip().upper(),
         "macro_state": dict(macro_state or {}),
-        "macro_state": dict(macro_state or {}),
-        "macro_state": dict(macro_state or {}),
+        "decision_context": dict(decision_context or {}),
     }
 
 
@@ -117,8 +117,6 @@ def build_doge_adjustment_premium_payload(snapshot: Any, *, timeframe: str, macr
             "higher_timeframe_total": int(snapshot.plan.higher_timeframe_total),
             "high_risk": high_risk,
             "high_risk_reason": high_risk_reason,
-            "macro_state": dict(macro_state or {}),
-            "macro_state": dict(macro_state or {}),
             "macro_state": dict(macro_state or {}),
         },
     }

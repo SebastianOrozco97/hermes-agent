@@ -11,11 +11,33 @@ class GridLevel:
 @dataclass(frozen=True)
 class GridPlan:
     symbol: str
+    market_price: Decimal
     levels: List[GridLevel]
     total_required_capital: Decimal
     stop_loss_price_lower: Decimal
     stop_loss_price_upper: Decimal
+    leverage: Decimal
+    regime: str
+    regime_reason: str
+    regime_allows_entry: bool
     rationale: str
+
+
+def _classify_grid_regime(
+    *,
+    market_price: Decimal,
+    atr: Decimal,
+    trend_bias_pct: Decimal | None,
+    atr_ratio_limit: Decimal,
+    trend_bias_limit: Decimal,
+) -> tuple[bool, str, str]:
+    atr_ratio = abs(atr) / market_price if market_price > 0 else Decimal("0")
+    normalized_trend_bias = abs(trend_bias_pct or Decimal("0"))
+    if atr_ratio > atr_ratio_limit:
+        return False, "high_volatility", f"ATR/price {atr_ratio:.4f} exceeds {atr_ratio_limit:.4f}"
+    if normalized_trend_bias > trend_bias_limit:
+        return False, "trend", f"trend bias {normalized_trend_bias:.4f} exceeds {trend_bias_limit:.4f}"
+    return True, "range_bound", f"ATR/price {atr_ratio:.4f} and trend bias {normalized_trend_bias:.4f} stay inside range limits"
 
 def plan_dynamic_grid(
     symbol: str, 
@@ -23,7 +45,11 @@ def plan_dynamic_grid(
     atr: Decimal, 
     available_capital: Decimal, 
     grids_per_side: int = 5,
-    atr_multiplier: Decimal = Decimal("2.0")
+    atr_multiplier: Decimal = Decimal("2.0"),
+    trend_bias_pct: Decimal | None = None,
+    leverage: Decimal = Decimal("1"),
+    atr_ratio_limit: Decimal = Decimal("0.08"),
+    trend_bias_limit: Decimal = Decimal("0.015"),
 ) -> GridPlan:
     """
     Calculates a symmetric grid based on volatility (ATR).
@@ -61,14 +87,29 @@ def plan_dynamic_grid(
     # Protective bounds (Stop Loss points)
     sl_lower = lower_bound - grid_spacing
     sl_upper = upper_bound + grid_spacing
+    regime_allows_entry, regime, regime_reason = _classify_grid_regime(
+        market_price=market_price,
+        atr=atr,
+        trend_bias_pct=trend_bias_pct,
+        atr_ratio_limit=atr_ratio_limit,
+        trend_bias_limit=trend_bias_limit,
+    )
     
-    rationale = f"Grid calculated with ATR {atr}. Range: {lower_bound} to {upper_bound}. Spacing: {grid_spacing}."
+    rationale = (
+        f"Grid calculated with ATR {atr}. Range: {lower_bound} to {upper_bound}. "
+        f"Spacing: {grid_spacing}. Regime: {regime} ({regime_reason})."
+    )
     
     return GridPlan(
         symbol=symbol,
+        market_price=market_price,
         levels=levels,
         total_required_capital=available_capital,
         stop_loss_price_lower=sl_lower,
         stop_loss_price_upper=sl_upper,
+        leverage=leverage,
+        regime=regime,
+        regime_reason=regime_reason,
+        regime_allows_entry=regime_allows_entry,
         rationale=rationale
     )

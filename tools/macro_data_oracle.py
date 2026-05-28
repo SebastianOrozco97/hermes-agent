@@ -25,6 +25,24 @@ class MacroState:
             "rationale": self.rationale
         }
 
+
+def classify_macro_alignment(state: MacroState | Mapping[str, Any]) -> str:
+    if isinstance(state, MacroState):
+        payload = state.to_dict()
+    else:
+        payload = dict(state or {})
+
+    trend_1h = str(payload.get("btc_trend_1h", "neutral") or "neutral").strip().lower()
+    trend_4h = str(payload.get("btc_trend_4h", "neutral") or "neutral").strip().lower()
+    global_bias = str(payload.get("global_funding_bias", "neutral") or "neutral").strip().lower()
+    risk_level = str(payload.get("risk_level", "unknown") or "unknown").strip().lower()
+
+    if risk_level in {"unknown", "high_volatility"} and trend_4h == "bearish":
+        return "blocked"
+    if trend_1h == "bearish" or trend_4h == "bearish" or global_bias == "negative" or risk_level == "high_volatility":
+        return "divergent"
+    return "aligned"
+
 def fetch_btc_macro_state() -> MacroState:
     """
     Fetches real-time context about Bitcoin (the crypto macro index) 

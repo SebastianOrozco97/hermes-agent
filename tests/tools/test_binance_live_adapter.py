@@ -8,6 +8,7 @@ from tools.binance_guardrails import BinanceTradeProposal
 from tools.binance_live_adapter import (
     BinanceFuturesLiveExecutor,
     BinanceLiveExecutionError,
+    BinanceSpotLiveExecutor,
     SymbolTradingRules,
 )
 
@@ -128,11 +129,11 @@ def test_adjust_protective_orders_places_new_orders_before_cancelling_previous(m
     def _fake_request(method, path, params=None, signed=False):
         recorded_params = dict(params or {})
         calls.append((method, path, recorded_params))
-        if method == "POST" and path == "/fapi/v1/order":
+        if method == "POST" and path == "/fapi/v1/algoOrder":
             return {
                 "orderId": 100 + len([call for call in calls if call[0] == "POST"]),
                 "type": recorded_params.get("type"),
-                "stopPrice": recorded_params.get("stopPrice"),
+                "triggerPrice": recorded_params.get("triggerPrice"),
             }
         if method == "DELETE" and path == "/fapi/v1/order":
             return {"orderId": recorded_params.get("orderId"), "status": "CANCELED"}
@@ -155,14 +156,85 @@ def test_adjust_protective_orders_places_new_orders_before_cancelling_previous(m
         },
     )
 
-    assert [call[0] for call in calls] == ["POST", "POST", "DELETE", "DELETE"]
+    assert [(call[0], call[1]) for call in calls] == [
+        ("POST", "/fapi/v1/algoOrder"),
+        ("POST", "/fapi/v1/algoOrder"),
+        ("DELETE", "/fapi/v1/order"),
+        ("DELETE", "/fapi/v1/order"),
+    ]
     assert calls[0][2]["type"] == "STOP_MARKET"
-    assert calls[0][2]["stopPrice"] == "0.10021"
+    assert calls[0][2]["triggerPrice"] == "0.10021"
+    assert calls[0][2]["algoType"] == "CONDITIONAL"
     assert calls[1][2]["type"] == "TAKE_PROFIT_MARKET"
-    assert calls[1][2]["stopPrice"] == "0.10123"
+    assert calls[1][2]["triggerPrice"] == "0.10123"
+    assert calls[1][2]["algoType"] == "CONDITIONAL"
     assert [call[2]["orderId"] for call in calls[2:]] == [11, 12]
     assert result["new_orders"]["stop_loss_price"] == "0.10021"
     assert result["new_orders"]["take_profit_price"] == "0.10123"
+
+
+def test_spot_fetch_free_balance_signs_account_request(monkeypatch):
+    executor = BinanceSpotLiveExecutor(
+        base_url="https://example.invalid",
+        api_key="key",
+        api_secret="secret",
+    )
+    monkeypatch.setattr("tools.binance_live_adapter.time.time", lambda: 1000.0)
+
+    calls: list[tuple[str, str, dict[str, object], float, dict[str, str]]] = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"balances": [{"asset": "USDT", "free": "12.34"}]}
+
+    executor._session.request = lambda method, url, params=None, timeout=None: calls.append(
+        (method, url, dict(params or {}), timeout, dict(executor._session.headers))
+    ) or _FakeResponse()
+
+    balance = executor.fetch_free_balance("USDT")
+
+    assert balance == Decimal("12.34")
+    assert calls[0][0] == "GET"
+    assert calls[0][1] == "https://example.invalid/api/v3/account"
+    assert calls[0][2]["recvWindow"] == 5000
+    assert calls[0][2]["timestamp"] == 1000000
+    assert "signature" in calls[0][2]
+    assert calls[0][4]["X-MBX-APIKEY"] == "key"
+
+
+def test_spot_universal_transfer_uses_signed_endpoint(monkeypatch):
+    executor = BinanceSpotLiveExecutor(
+        base_url="https://example.invalid",
+        api_key="key",
+        api_secret="secret",
+    )
+    monkeypatch.setattr("tools.binance_live_adapter.time.time", lambda: 1000.0)
+
+    calls: list[tuple[str, str, dict[str, object], float, dict[str, str]]] = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"tranId": 77}
+
+    executor._session.request = lambda method, url, params=None, timeout=None: calls.append(
+        (method, url, dict(params or {}), timeout, dict(executor._session.headers))
+    ) or _FakeResponse()
+
+    result = executor.universal_transfer("USDT", Decimal("5.25"), "MAIN", "UMFUTURE")
+
+    assert result == {"tranId": 77}
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == "https://example.invalid/sapi/v1/asset/universalTransfer"
+    assert calls[0][2]["asset"] == "USDT"
+    assert calls[0][2]["amount"] == "5.25"
+    assert calls[0][2]["fromAccountType"] == "MAIN"
+    assert calls[0][2]["toAccountType"] == "UMFUTURE"
+    assert "signature" in calls[0][2]
+    assert calls[0][4]["X-MBX-APIKEY"] == "key"
 
 
 def test_submit_trade_retries_protective_orders_before_rollback(monkeypatch):

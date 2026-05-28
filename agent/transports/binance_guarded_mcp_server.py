@@ -23,11 +23,7 @@ from tools.binance_live_adapter import (
     BinanceFuturesLiveExecutor,
     BinanceLiveExecutionError,
 )
-from tools.execution_orchestrators import execute_arbitrage, execute_grid
-from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
-from tools.doge_grid_advisor import plan_dynamic_grid
-
-from tools.execution_orchestrators import execute_arbitrage, execute_grid
+from tools.execution_orchestrators import execute_arbitrage, execute_grid, reconcile_grid
 from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
 from tools.doge_grid_advisor import plan_dynamic_grid
 
@@ -37,6 +33,7 @@ from tools.binance_guardrails import (
     BinanceTradeProposal,
     _parse_bool,
     evaluate_trade_proposal,
+    get_strategy_leverage_cap,
     get_kill_switch_path,
     is_kill_switch_active,
     set_kill_switch,
@@ -55,6 +52,8 @@ from tools.binance_paper_runtime import (
     get_trade_approval,
     open_paper_position,
     record_live_trade_execution_failure,
+    record_live_trade_execution_success,
+    record_live_trade_protection_adjustment,
     record_market_evidence,
     record_doge_premium_analysis_decision,
     record_trade_approval,
@@ -523,6 +522,7 @@ def _ensure_trade_approval_from_premium_request(
         evidence_id=str(material_payload.get("evidence_id") or ""),
         market_summary=str(material_payload.get("market_summary") or ""),
         requested_via=requested_via,
+        decision_context=material_payload.get("decision_context") or None,
     )
 
 
@@ -1236,6 +1236,16 @@ def _adjust_live_trade_protection_result(
         "management": management,
         "adjustment": adjustment,
     }
+    approval_payload = getattr(snapshot, "approval", {}) or {}
+    result["adjustment_event"] = record_live_trade_protection_adjustment(
+        symbol=normalized_symbol,
+        approval_id=str(getattr(snapshot, "approval_id", "") or approval_payload.get("approval_id") or ""),
+        management=management,
+        adjustment=adjustment,
+        premium_request=premium_request if premium_request is not None else None,
+        premium_assessment=premium_assessment or None,
+        decision_context=approval_payload.get("decision_context") or None,
+    )
     if premium_request is not None and str(premium_request.get("analysis_outcome") or "").strip().lower() == "passed":
         result["premium_request"] = premium_request
         result["premium_assessment"] = premium_assessment
@@ -1264,6 +1274,7 @@ def _paper_decision_result(
     verifier_passed: bool,
     verifier_confidence: float,
     rationale: str,
+    macro_alignment: str,
     dry_run: bool,
     use_persistent_account: bool,
 ) -> dict[str, Any]:
@@ -1282,6 +1293,7 @@ def _paper_decision_result(
             "verifier_passed": verifier_passed,
             "verifier_confidence": verifier_confidence or None,
             "rationale": rationale,
+            "macro_alignment": macro_alignment,
             "dry_run": dry_run,
         }
     )
@@ -1329,6 +1341,7 @@ def _submit_trade_result(
     verifier_confidence: float,
     rationale: str,
     dry_run: bool,
+    macro_alignment: str = "aligned",
     approval_id: str = "",
     evidence_id: str = "",
     use_persistent_account: bool = True,
@@ -1356,6 +1369,7 @@ def _submit_trade_result(
             verifier_passed=verifier_passed,
             verifier_confidence=verifier_confidence,
             rationale=rationale,
+            macro_alignment=macro_alignment,
             dry_run=dry_run,
             use_persistent_account=use_persistent_account,
         )
@@ -1398,6 +1412,7 @@ def _submit_trade_result(
                 reference_price=_get_live_executor(require_credentials=False).get_reference_price(symbol),
                 approval_id=approval_id,
                 evidence_id=evidence_id,
+                decision_context=(approval_record or {}).get("decision_context"),
             )
             if approval_record is not None:
                 consume_trade_approval(approval_id, paper["proposal"])
@@ -1453,6 +1468,7 @@ def _submit_trade_result(
             "verifier_passed": verifier_passed,
             "verifier_confidence": verifier_confidence or None,
             "rationale": rationale,
+            "macro_alignment": macro_alignment,
             "dry_run": dry_run,
         }
     )
@@ -1526,6 +1542,7 @@ def _submit_trade_result(
                 "evidence_id": str(evidence_id or "").strip() or None,
                 "mode": normalized_mode,
             },
+            decision_context=(approval_record or {}).get("decision_context"),
         )
         return {
             "success": False,
@@ -1538,6 +1555,15 @@ def _submit_trade_result(
     if approval_record is not None:
         approval_record = consume_trade_approval(approval_id, proposal)
 
+    live_execution_event = record_live_trade_execution_success(
+        proposal=proposal,
+        execution=execution,
+        approval_id=approval_id,
+        evidence_id=evidence_id,
+        details={"mode": normalized_mode},
+        decision_context=(approval_record or {}).get("decision_context"),
+    )
+
     return {
         "success": True,
         "execution_mode": "live",
@@ -1545,6 +1571,7 @@ def _submit_trade_result(
         "live_account_overview": overview,
         "execution": execution,
         "approval": approval_record,
+        "live_execution_event": live_execution_event,
     }
 
 
@@ -1667,6 +1694,7 @@ def _build_server():
         verifier_passed: bool = False,
         verifier_confidence: float = 0.0,
         rationale: str = "",
+        macro_alignment: str = "aligned",
         dry_run: bool = True,
         use_persistent_account: bool = True,
     ) -> str:
@@ -1689,6 +1717,7 @@ def _build_server():
             verifier_passed=verifier_passed,
             verifier_confidence=verifier_confidence,
             rationale=rationale,
+            macro_alignment=macro_alignment,
             dry_run=dry_run,
             use_persistent_account=use_persistent_account,
         )
@@ -1750,6 +1779,7 @@ def _build_server():
         verifier_passed: bool = False,
         verifier_confidence: float = 0.0,
         rationale: str = "",
+        macro_alignment: str = "aligned",
         dry_run: bool = False,
         evidence_id: str = "",
         market_summary: str = "",
@@ -1776,6 +1806,7 @@ def _build_server():
             verifier_passed=verifier_passed,
             verifier_confidence=verifier_confidence,
             rationale=rationale,
+            macro_alignment=macro_alignment,
             dry_run=dry_run,
             use_persistent_account=use_persistent_account,
         )
@@ -1888,6 +1919,7 @@ def _build_server():
         verifier_passed: bool = False,
         verifier_confidence: float = 0.0,
         rationale: str = "",
+        macro_alignment: str = "aligned",
         dry_run: bool = True,
         approval_id: str = "",
         evidence_id: str = "",
@@ -1914,6 +1946,7 @@ def _build_server():
                 verifier_passed=verifier_passed,
                 verifier_confidence=verifier_confidence,
                 rationale=rationale,
+                macro_alignment=macro_alignment,
                 dry_run=dry_run,
                 approval_id=approval_id,
                 evidence_id=evidence_id,
@@ -1990,7 +2023,7 @@ def _build_server():
 
 
     @mcp.tool()
-    def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 5, notify_whatsapp: bool = True) -> str:
+    def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 2, notify_whatsapp: bool = True) -> str:
         """Executes a Phase 2 delta-neutral arbitrage (Spots & Futures). Use when Scout advises an Arbitrage."""
         _ensure_runtime_env_loaded()
         try:
@@ -2005,9 +2038,18 @@ def _build_server():
             
             if notify_whatsapp and result.get("success"):
                 if dry_run:
-                    msg = "🧪 SIMULACION FASE 2 ARBITRAJE EXITOSA\nPar: " + symbol + "\nSpot Buy: " + str(result.get('spot_buy_qty')) + "\nTransf: " + str(result.get('transfer_amount')) + "\nFutures Sell: " + str(result.get('futures_short_qty'))
+                    msg = (
+                        "🧪 SIMULACION FASE 2 ARBITRAJE EXITOSA\nPar: " + symbol +
+                        "\nSpot Buy: " + str(result.get("spot_buy_qty")) + " DOGE" +
+                        "\nTransf: " + str(result.get("transfer_amount")) + " USDT" +
+                        "\nFutures Sell: " + str(result.get("futures_short_qty")) + " DOGE"
+                    )
                 else:
-                    msg = "✅ ENTRAMOS A ARBITRAJE DELTA NEUTRAL\nPar: " + symbol + "\nYield Esperado > 0.10%\nAcciones:\n- Spot (Leg 1) COMPRADO\n- Universal Transfer EFECTUADO\n- Futures (Leg 2) SHORTEADO"
+                    msg = (
+                        "✅ ENTRAMOS A ARBITRAJE DELTA NEUTRAL\nPar: " + symbol +
+                        "\nExecution ID: " + str(result.get("execution_id")) +
+                        "\nYield Esperado > 0.10%\nAcciones:\n- Spot (Leg 1) COMPRADO\n- Universal Transfer EFECTUADO\n- Futures (Leg 2) SHORTEADO"
+                    )
                 _send_whatsapp_home_message(msg)
             elif notify_whatsapp and not result.get("success"):
                 _send_whatsapp_home_message("FAIL: FALLO FASE 2 ARBITRAJE " + symbol + "\nError: " + str(result.get('error')))
@@ -2019,7 +2061,7 @@ def _build_server():
             return json.dumps({"success": False, "error": str(e)}, indent=2)
 
     @mcp.tool()
-    def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, notify_whatsapp: bool = True) -> str:
+    def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, trend_bias_pct: float = 0.0, notify_whatsapp: bool = True) -> str:
         """Executes a Phase 3 dynamic ATR-based grid. Use when Scout advises a Grid."""
         _ensure_runtime_env_loaded()
         try:
@@ -2029,7 +2071,9 @@ def _build_server():
                 atr=Decimal(str(atr)),
                 available_capital=Decimal(str(capital_usd)),
                 grids_per_side=grids_per_side,
-                atr_multiplier=Decimal("1.5")
+                atr_multiplier=Decimal("1.5"),
+                trend_bias_pct=Decimal(str(trend_bias_pct)),
+                leverage=get_strategy_leverage_cap("grid"),
             )
             result = execute_grid(plan, dry_run=dry_run)
             
@@ -2048,65 +2092,37 @@ def _build_server():
             if notify_whatsapp: _send_whatsapp_home_message(msg)
             return json.dumps({"success": False, "error": str(e)}, indent=2)
 
-
     @mcp.tool()
-    def binance_execute_arbitrage(symbol: str, capital_usd: float, market_price: float, funding_rate: float, dry_run: bool = False, leverage: int = 5, notify_whatsapp: bool = True) -> str:
-        """Executes a Phase 2 delta-neutral arbitrage (Spots & Futures). Use when Scout advises an Arbitrage."""
+    def binance_reconcile_grid(symbol: str = "", notify_whatsapp: bool = True) -> str:
+        """Monitor active live grids and freeze them if price breaks outside their configured range."""
         _ensure_runtime_env_loaded()
         try:
-            plan = plan_delta_neutral_arbitrage(
-                symbol=symbol,
-                available_capital_usd=Decimal(str(capital_usd)),
-                market_price=Decimal(str(market_price)),
-                funding_rate=Decimal(str(funding_rate)),
-                leverage=Decimal(str(leverage))
-            )
-            result = execute_arbitrage(plan, dry_run=dry_run)
-            
-            if notify_whatsapp and result.get("success"):
-                if dry_run:
-                    msg = "🧪 SIMULACION FASE 2 ARBITRAJE EXITOSA\nPar: " + symbol + "\nSpot Buy: " + str(result.get('spot_buy_qty')) + "\nTransf: " + str(result.get('transfer_amount')) + "\nFutures Sell: " + str(result.get('futures_short_qty'))
-                else:
-                    msg = "✅ ENTRAMOS A ARBITRAJE DELTA NEUTRAL\nPar: " + symbol + "\nYield Esperado > 0.10%\nAcciones:\n- Spot (Leg 1) COMPRADO\n- Universal Transfer EFECTUADO\n- Futures (Leg 2) SHORTEADO"
-                _send_whatsapp_home_message(msg)
-            elif notify_whatsapp and not result.get("success"):
-                _send_whatsapp_home_message("FAIL: FALLO FASE 2 ARBITRAJE " + symbol + "\nError: " + str(result.get('error')))
-                
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            msg = "FAIL: ERROR INTERNO FASE 2 ARBITRAJE " + symbol + ": " + str(e)
-            if notify_whatsapp: _send_whatsapp_home_message(msg)
-            return json.dumps({"success": False, "error": str(e)}, indent=2)
-
-    @mcp.tool()
-    def binance_execute_grid(symbol: str, capital_usd: float, market_price: float, atr: float, dry_run: bool = False, grids_per_side: int = 3, notify_whatsapp: bool = True) -> str:
-        """Executes a Phase 3 dynamic ATR-based grid. Use when Scout advises a Grid."""
-        _ensure_runtime_env_loaded()
-        try:
-            plan = plan_dynamic_grid(
-                symbol=symbol,
-                market_price=Decimal(str(market_price)),
-                atr=Decimal(str(atr)),
-                available_capital=Decimal(str(capital_usd)),
-                grids_per_side=grids_per_side,
-                atr_multiplier=Decimal("1.5")
-            )
-            result = execute_grid(plan, dry_run=dry_run)
-            
-            if notify_whatsapp and result.get("success"):
-                if dry_run:
-                    msg = "🧪 SIMULACION FASE 3 GRID EXITOSA\nPar: " + symbol + "\nOrdenes Calculadas: " + str(len(plan.levels))
-                else:
-                    msg = "✅ GRID DINAMICA DESPLEGADA\nPar: " + symbol + "\nOrdenes Generadas: " + str(result.get('orders_placed')) + "\nCapital Asignado: " + str(capital_usd) + " USD\nATR Registrado: " + str(atr)
-                _send_whatsapp_home_message(msg)
-            elif notify_whatsapp and not result.get("success"):
-                _send_whatsapp_home_message("FAIL: FALLO FASE 3 GRID " + symbol + "\nError: " + str(result.get('error')))
-
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            msg = "FAIL: ERROR INTERNO FASE 3 GRID " + symbol + ": " + str(e)
-            if notify_whatsapp: _send_whatsapp_home_message(msg)
-            return json.dumps({"success": False, "error": str(e)}, indent=2)
+            result = reconcile_grid(symbol=symbol)
+            notifications: list[dict[str, Any]] = []
+            if notify_whatsapp:
+                for item in result.get("reconciled", []):
+                    residual = item.get("residual_position") or {}
+                    residual_text = "sin inventario residual"
+                    if residual:
+                        residual_text = (
+                            f"inventario residual {residual.get('position_amt', '0')} @ {residual.get('entry_price', '0')}"
+                        )
+                    notifications.append(
+                        _send_whatsapp_home_message(
+                            "GRID DOGE BLOQUEADA POR BREAKOUT\n"
+                            + "Par: " + str(item.get("symbol") or "")
+                            + "\nExecution ID: " + str(item.get("execution_id") or "")
+                            + "\nLado ruptura: " + str(item.get("breakout_side") or "")
+                            + "\nPrecio referencia: " + str(item.get("reference_price") or "")
+                            + "\nEstado: " + str(item.get("status") or "")
+                            + "\nResidual: " + residual_text
+                        )
+                    )
+            return json.dumps({"success": True, "reconciled": result, "whatsapp_notifications": notifications}, indent=2)
+        except Exception as exc:
+            if notify_whatsapp:
+                _send_whatsapp_home_message("FAIL: ERROR GRID RECONCILER " + str(symbol or "DOGEUSDT") + "\nError: " + str(exc))
+            return json.dumps({"success": False, "error": str(exc)}, indent=2)
 
     return mcp
 

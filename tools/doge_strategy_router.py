@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any, Mapping
+
+from tools.binance_guardrails import get_strategy_leverage_cap
+from tools.binance_live_adapter import BinanceFuturesLiveExecutor
+from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
+from tools.doge_grid_advisor import plan_dynamic_grid
+from tools.doge_signal_engine import DogeSignalSnapshot, _atr, analyze_doge_15m_signal, parse_binance_klines
+from tools.doge_strategy_selector import (
+    RankedOpportunity,
+    StrategyOpportunity,
+    StrategySelection,
+    arbitrage_opportunity_from_plan,
+    grid_opportunity_from_plan,
+    overlay_opportunity_from_signal,
+    select_doge_strategy,
+)
+
+
+_STRATEGY_LABELS = {
+    "overlay_tactical_long": "Overlay tactico largo",
+    "funding_arbitrage": "Arbitraje de funding",
+    "atr_grid": "ATR grid",
+    "no_trade": "No trade",
+}
+
+
+def _decimal_text(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return str(normalized.quantize(Decimal("1")))
+    return format(normalized, "f")
+
+
+def strategy_label(strategy_id: str) -> str:
+    normalized = str(strategy_id or "").strip()
+    if not normalized:
+        return "Desconocida"
+    return _STRATEGY_LABELS.get(normalized, normalized.replace("_", " ").title())
+
+
+def _ranked_line(ranked: RankedOpportunity) -> str:
+    opportunity = ranked.opportunity
+    label = strategy_label(opportunity.strategy_id)
+    if ranked.eligible_for_selection:
+        return (
+            f"{ranked.rank}. {label} | score {_decimal_text(ranked.selection_score)} | "
+            f"edge {_decimal_text(opportunity.expected_edge)} | conf {_decimal_text(opportunity.confidence)}"
+        )
+    reason = ranked.rejection_reason or "; ".join(opportunity.blockers) or "sin detalle"
+    return f"{ranked.rank}. {label} | bloqueada: {reason}"
+
+
+def build_strategy_digest_lines(selection: StrategySelection) -> list[str]:
+    chosen = selection.chosen_opportunity
+    lines = [f"DOGE STRATEGY ROUTER ({selection.symbol})"]
+
+    if selection.abstained:
+        lines.append("Primaria: NO TRADE.")
+        lines.append(f"Abstencion: {selection.abstain_reason}.")
+    else:
+        lines.append(f"Primaria: {strategy_label(chosen.strategy_id)} -> {chosen.action}.")
+        lines.append(f"Tesis: {chosen.operator_summary}")
+
+    lines.append(
+        "Marco: "
+        f"macro {chosen.macro_alignment} | horizonte {chosen.holding_horizon} | "
+        f"capital {_decimal_text(chosen.capital_required_usd)} USD | "
+        f"edge {_decimal_text(chosen.expected_edge)} | confianza {_decimal_text(chosen.confidence)}"
+    )
+
+    alternatives = list(selection.rejected_alternatives)
+    if alternatives:
+        lines.append("Alternativas:")
+        lines.extend(_ranked_line(ranked) for ranked in alternatives)
+
+    lines.append("Diagnosticos: doge_live_scout.py | doge_arbitrage_scout.py | doge_grid_scout.py")
+    return lines
+
+
+def _normalize_json_payload(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return _decimal_text(value)
+    if isinstance(value, Mapping):
+        return {str(key): _normalize_json_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_json_payload(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _opportunity_snapshot(opportunity: StrategyOpportunity) -> dict[str, Any]:
+    return {
+        "strategy_id": opportunity.strategy_id,
+        "action": opportunity.action,
+        "eligible": opportunity.eligible,
+        "expected_edge": _decimal_text(opportunity.expected_edge),
+        "confidence": _decimal_text(opportunity.confidence),
+        "capital_required_usd": _decimal_text(opportunity.capital_required_usd),
+        "holding_horizon": opportunity.holding_horizon,
+        "macro_alignment": opportunity.macro_alignment,
+        "regime_tags": list(opportunity.regime_tags),
+        "blockers": list(opportunity.blockers),
+        "operator_summary": opportunity.operator_summary,
+    }
+
+
+def build_strategy_decision_context(
+    selection: StrategySelection,
+    *,
+    macro_state: Mapping[str, Any] | None = None,
+    verifier_assessments: Mapping[str, Any] | None = None,
+    market_context: Mapping[str, Any] | None = None,
+    selector_family: str = "doge_meta_selector_v1",
+) -> dict[str, Any]:
+    alternatives: list[dict[str, Any]] = []
+    for ranked in selection.rejected_alternatives:
+        payload = _opportunity_snapshot(ranked.opportunity)
+        payload.update(
+            {
+                "rank": ranked.rank,
+                "selection_score": _decimal_text(ranked.selection_score),
+                "eligible_for_selection": ranked.eligible_for_selection,
+                "rejection_reason": ranked.rejection_reason,
+            }
+        )
+        alternatives.append(payload)
+
+    return {
+        "selector_family": selector_family,
+        "selected_strategy_id": selection.chosen_strategy_id,
+        "selected_strategy": _opportunity_snapshot(selection.chosen_opportunity),
+        "alternatives_considered": alternatives,
+        "selector_outcome": {
+            "abstained": selection.abstained,
+            "abstain_reason": selection.abstain_reason,
+        },
+        "macro_state": _normalize_json_payload(macro_state or {}),
+        "verifier_assessments": _normalize_json_payload(verifier_assessments or {}),
+        "market_context": _normalize_json_payload(market_context or {}),
+    }
+
+
+def _build_overlay_opportunity(
+    executor: BinanceFuturesLiveExecutor,
+    *,
+    symbol: str,
+    timeframe: str,
+    notional_usd: Decimal,
+    min_signal_score: int,
+    macro_alignment: str,
+    overlay_signal: DogeSignalSnapshot | None = None,
+) -> StrategyOpportunity:
+    signal = overlay_signal
+    if signal is None:
+        raw_klines = executor.get_klines(symbol, interval=timeframe, limit=120)
+        closed_klines = raw_klines[:-1] if len(raw_klines) > 1 else raw_klines
+        signal = analyze_doge_15m_signal(
+            parse_binance_klines(closed_klines),
+            score_threshold=min_signal_score,
+            timeframe=timeframe,
+        )
+    return overlay_opportunity_from_signal(signal, notional_usd=notional_usd, macro_alignment=macro_alignment)
+
+
+def _build_arbitrage_opportunity(
+    executor: BinanceFuturesLiveExecutor,
+    *,
+    symbol: str,
+    capital_usd: Decimal,
+    base_macro_alignment: str,
+) -> StrategyOpportunity:
+    premium_info = executor._request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
+    funding_rate = Decimal(str(premium_info.get("lastFundingRate", "0")))
+    market_price = executor.get_reference_price(symbol)
+    plan = plan_delta_neutral_arbitrage(
+        symbol=symbol,
+        available_capital_usd=capital_usd,
+        market_price=market_price,
+        funding_rate=funding_rate,
+        leverage=get_strategy_leverage_cap("arbitrage"),
+    )
+    macro_alignment = "cautious" if base_macro_alignment in {"blocked", "divergent"} else "aligned"
+    return arbitrage_opportunity_from_plan(plan, macro_alignment=macro_alignment)
+
+
+def _build_grid_opportunity(
+    executor: BinanceFuturesLiveExecutor,
+    *,
+    symbol: str,
+    capital_usd: Decimal,
+    base_macro_alignment: str,
+) -> StrategyOpportunity:
+    market_price = executor.get_reference_price(symbol)
+    klines = executor._request("GET", "/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 40})
+    candles = parse_binance_klines(klines)
+    atr_value = _atr(candles, period=14)
+    trend_bias_pct = Decimal("0")
+    if len(candles) >= 12 and candles[0].close > 0:
+        trend_bias_pct = (candles[-1].close - candles[0].close) / candles[0].close
+
+    plan = plan_dynamic_grid(
+        symbol=symbol,
+        market_price=market_price,
+        atr=atr_value,
+        available_capital=capital_usd,
+        grids_per_side=3,
+        atr_multiplier=Decimal("1.5"),
+        trend_bias_pct=trend_bias_pct,
+        leverage=get_strategy_leverage_cap("grid"),
+    )
+    macro_alignment = "blocked" if base_macro_alignment == "blocked" else "cautious"
+    if base_macro_alignment == "aligned":
+        macro_alignment = "aligned"
+    return grid_opportunity_from_plan(plan, macro_alignment=macro_alignment)
+
+
+def build_live_strategy_selection(
+    executor: BinanceFuturesLiveExecutor,
+    *,
+    symbol: str,
+    timeframe: str,
+    capital_usd: Decimal,
+    min_signal_score: int,
+    base_macro_alignment: str,
+    minimum_score: Decimal = Decimal("0.55"),
+    conflict_margin: Decimal = Decimal("0.08"),
+    overlay_signal: DogeSignalSnapshot | None = None,
+) -> StrategySelection:
+    opportunities = (
+        _build_overlay_opportunity(
+            executor,
+            symbol=symbol,
+            timeframe=timeframe,
+            notional_usd=capital_usd,
+            min_signal_score=min_signal_score,
+            macro_alignment=base_macro_alignment,
+            overlay_signal=overlay_signal,
+        ),
+        _build_arbitrage_opportunity(
+            executor,
+            symbol=symbol,
+            capital_usd=capital_usd,
+            base_macro_alignment=base_macro_alignment,
+        ),
+        _build_grid_opportunity(
+            executor,
+            symbol=symbol,
+            capital_usd=capital_usd,
+            base_macro_alignment=base_macro_alignment,
+        ),
+    )
+    return select_doge_strategy(
+        opportunities,
+        minimum_score=minimum_score,
+        conflict_margin=conflict_margin,
+    )
