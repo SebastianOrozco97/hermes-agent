@@ -100,6 +100,23 @@ class BinanceFuturesLiveExecutor:
         if self.api_key:
             self._session.headers.update({"X-MBX-APIKEY": self.api_key})
         self._symbol_rules_cache: dict[str, SymbolTradingRules] = {}
+        self._time_offset_ms: Optional[int] = None
+
+    def _get_timestamp(self) -> int:
+        if self._time_offset_ms is None:
+            try:
+                local_b = int(time.time() * 1000)
+                r = self._session.request("GET", f"{self.base_url}/fapi/v1/time", timeout=self.timeout_s)
+                r.raise_for_status()
+                st = r.json().get("serverTime")
+                local_a = int(time.time() * 1000)
+                if st:
+                    self._time_offset_ms = int(st) - (local_b + (local_a - local_b) // 2)
+                else:
+                    self._time_offset_ms = 0
+            except Exception:
+                self._time_offset_ms = 0
+        return int(time.time() * 1000) + (self._time_offset_ms or 0)
 
     def _protective_retry_attempts(self) -> int:
         raw = os.getenv("BINANCE_FUTURES_PROTECTIVE_RETRY_ATTEMPTS", "3").strip() or "3"
@@ -156,7 +173,7 @@ class BinanceFuturesLiveExecutor:
         if signed:
             if not self.api_key or not self.api_secret:
                 raise BinanceLiveExecutionError("signed Binance request requires API credentials")
-            payload.setdefault("timestamp", int(time.time() * 1000))
+            payload.setdefault("timestamp", self._get_timestamp())
             payload.setdefault("recvWindow", self.recv_window_ms)
             query = urlencode(payload, doseq=True)
             payload["signature"] = hmac.new(
@@ -515,21 +532,23 @@ class BinanceFuturesLiveExecutor:
         }
         stop_order = self._request(
             "POST",
-            "/fapi/v1/order",
+            "/fapi/v1/algoOrder",
             params={
                 **common,
                 "type": "STOP_MARKET",
-                "stopPrice": _format_decimal(normalized_stop_price),
+                "triggerPrice": _format_decimal(normalized_stop_price),
+                "algoType": "CONDITIONAL"
             },
             signed=True,
         )
         take_profit_order = self._request(
             "POST",
-            "/fapi/v1/order",
+            "/fapi/v1/algoOrder",
             params={
                 **common,
                 "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": _format_decimal(normalized_take_profit_price),
+                "triggerPrice": _format_decimal(normalized_take_profit_price),
+                "algoType": "CONDITIONAL"
             },
             signed=True,
         )
@@ -602,6 +621,7 @@ class BinanceFuturesLiveExecutor:
                 except Exception as snapshot_exc:
                     position_note = f"position lookup failed: {snapshot_exc}"
                 errors.append(f"attempt {attempt}/{attempts}: {exc} ({position_note})")
+                
                 if attempt >= attempts:
                     break
                 time.sleep(delay_s)
@@ -613,17 +633,21 @@ class BinanceFuturesLiveExecutor:
         if not normalized_symbol:
             raise BinanceLiveExecutionError("symbol is required for open-order lookup")
         expected_close_side = self._close_side(entry_side) if str(entry_side or "").strip() else ""
-        body = self._request(
-            "GET",
-            "/fapi/v1/openOrders",
-            params={"symbol": normalized_symbol},
-            signed=True,
-        )
-        if not isinstance(body, list):
-            raise BinanceLiveExecutionError(
-                f"unexpected openOrders payload for {normalized_symbol}: {type(body).__name__}"
-            )
-
+        
+        body: list[dict[str, Any]] = []
+        for endpoint in ("/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders"):
+            try:
+                res = self._request(
+                    "GET",
+                    endpoint,
+                    params={"symbol": normalized_symbol},
+                    signed=True,
+                )
+                if isinstance(res, list):
+                    body.extend(res)
+            except Exception:
+                pass
+            
         def _order_rank(order: dict[str, Any]) -> int:
             for field in ("updateTime", "time", "orderId"):
                 try:
@@ -642,7 +666,7 @@ class BinanceFuturesLiveExecutor:
                 continue
             if str(order.get("closePosition", "") or "").strip().lower() != "true" and not _parse_bool(order.get("reduceOnly"), default=False):
                 continue
-            order_type = str(order.get("type", "") or "").strip().upper()
+            order_type = str(order.get("orderType", order.get("type", "")) or "").strip().upper()
             if order_type not in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
                 continue
             protective_orders.append(order)
@@ -653,14 +677,22 @@ class BinanceFuturesLiveExecutor:
                 if take_profit_order is None or _order_rank(order) >= _order_rank(take_profit_order):
                     take_profit_order = order
 
+        stop_price_val = None
+        if stop_order:
+            stop_price_val = stop_order.get("triggerPrice") or stop_order.get("stopPrice")
+        
+        take_profit_price_val = None
+        if take_profit_order:
+            take_profit_price_val = take_profit_order.get("triggerPrice") or take_profit_order.get("stopPrice")
+
         return {
             "symbol": normalized_symbol,
             "entry_side": str(entry_side or "").strip().upper() or None,
             "orders": protective_orders,
             "stop_loss": stop_order,
             "take_profit": take_profit_order,
-            "stop_loss_price": str((stop_order or {}).get("stopPrice") or ""),
-            "take_profit_price": str((take_profit_order or {}).get("stopPrice") or ""),
+            "stop_loss_price": str(stop_price_val or ""),
+            "take_profit_price": str(take_profit_price_val or ""),
         }
 
     def cancel_order(self, symbol: str, order_id: Any) -> dict[str, Any]:
