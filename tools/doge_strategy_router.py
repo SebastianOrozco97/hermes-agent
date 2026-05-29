@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping
 
 from tools.binance_guardrails import get_strategy_leverage_cap
 from tools.binance_live_adapter import BinanceFuturesLiveExecutor
+from tools.doge_strategy_scorecard import get_doge_strategy_scorecard
 from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
 from tools.doge_grid_advisor import plan_dynamic_grid
 from tools.doge_signal_engine import DogeSignalSnapshot, _atr, analyze_doge_15m_signal, parse_binance_klines
 from tools.doge_strategy_selector import (
     RankedOpportunity,
+    SelectorFeedbackPolicy,
     StrategyOpportunity,
     StrategySelection,
+    attach_selector_feedback,
     arbitrage_opportunity_from_plan,
     grid_opportunity_from_plan,
     overlay_opportunity_from_signal,
@@ -76,6 +80,20 @@ def build_strategy_digest_lines(selection: StrategySelection) -> list[str]:
         lines.append("Alternativas:")
         lines.extend(_ranked_line(ranked) for ranked in alternatives)
 
+    feedback_result = selection.feedback_result
+    if feedback_result is not None and feedback_result.policy.resolved_mode == "shadow":
+        if feedback_result.shadow_abstained:
+            lines.append(f"Shadow feedback: habria NO TRADE. {feedback_result.shadow_abstain_reason}.")
+        elif feedback_result.shadow_would_change_selection:
+            lines.append(
+                "Shadow feedback: habria priorizado "
+                f"{strategy_label(feedback_result.shadow_chosen_strategy_id)} usando evidencia historica por estrategia x regimen."
+            )
+        elif any(item.policy_action == "insufficient_sample" for item in feedback_result.evaluations):
+            lines.append("Shadow feedback: aun no hay muestra suficiente para cambiar la prioridad del selector.")
+        else:
+            lines.append("Shadow feedback: mantiene la misma prioridad con la evidencia historica reciente.")
+
     lines.append("Diagnosticos: doge_live_scout.py | doge_arbitrage_scout.py | doge_grid_scout.py")
     return lines
 
@@ -102,6 +120,7 @@ def _opportunity_snapshot(opportunity: StrategyOpportunity) -> dict[str, Any]:
         "capital_required_usd": _decimal_text(opportunity.capital_required_usd),
         "holding_horizon": opportunity.holding_horizon,
         "macro_alignment": opportunity.macro_alignment,
+        "primary_regime": opportunity.primary_regime,
         "regime_tags": list(opportunity.regime_tags),
         "blockers": list(opportunity.blockers),
         "operator_summary": opportunity.operator_summary,
@@ -141,7 +160,12 @@ def build_strategy_decision_context(
         "macro_state": _normalize_json_payload(macro_state or {}),
         "verifier_assessments": _normalize_json_payload(verifier_assessments or {}),
         "market_context": _normalize_json_payload(market_context or {}),
+        "selector_feedback": selection.feedback_result.to_dict() if selection.feedback_result is not None else None,
     }
+
+
+def _default_feedback_policy() -> SelectorFeedbackPolicy:
+    return SelectorFeedbackPolicy(mode="shadow")
 
 
 def _build_overlay_opportunity(
@@ -229,6 +253,7 @@ def build_live_strategy_selection(
     minimum_score: Decimal = Decimal("0.55"),
     conflict_margin: Decimal = Decimal("0.08"),
     overlay_signal: DogeSignalSnapshot | None = None,
+    feedback_policy: SelectorFeedbackPolicy | None = None,
 ) -> StrategySelection:
     opportunities = (
         _build_overlay_opportunity(
@@ -253,8 +278,23 @@ def build_live_strategy_selection(
             base_macro_alignment=base_macro_alignment,
         ),
     )
-    return select_doge_strategy(
+    selection = select_doge_strategy(
         opportunities,
+        minimum_score=minimum_score,
+        conflict_margin=conflict_margin,
+    )
+    resolved_feedback_policy = feedback_policy or _default_feedback_policy()
+    if resolved_feedback_policy.resolved_mode == "off":
+        return selection
+
+    scorecard = get_doge_strategy_scorecard(
+        days=max(1, int(resolved_feedback_policy.window_days)),
+        end_date=datetime.now(timezone.utc).date().isoformat(),
+    )
+    return attach_selector_feedback(
+        selection,
+        scorecard_summary=scorecard,
+        policy=resolved_feedback_policy,
         minimum_score=minimum_score,
         conflict_margin=conflict_margin,
     )

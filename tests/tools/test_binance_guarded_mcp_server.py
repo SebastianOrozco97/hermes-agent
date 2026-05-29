@@ -735,6 +735,15 @@ def test_build_paper_daily_summary_whatsapp_message_reports_daily_counts():
             "approvals_denied": 1,
             "open_positions_count": 1,
             "open_positions": [{"symbol": "DOGEUSDT", "side": "BUY"}],
+            "doge_strategy_scorecard": {
+                "total_matches": 2,
+                "approval_conversion_pct": "50",
+                "expectancy_usd": "0.15",
+                "median_hold_human": "5m 0s",
+                "strategy_regime_pairs": [
+                    {"strategy_id": "overlay_tactical_long", "regime_label": "breakout_trend"}
+                ],
+            },
         }
     )
 
@@ -742,6 +751,7 @@ def test_build_paper_daily_summary_whatsapp_message_reports_daily_counts():
     assert "Entradas 2 | Salidas 1 | PnL realizado 1.25 USD" in message
     assert "Aprobaciones pedidas 3 | Aprobadas 2 | Rechazadas 1" in message
     assert "Abiertas: DOGEUSDT BUY" in message
+    assert "Scorecard: DOGE conv 50% | expectancy 0.15 USD | hold med 5m 0s | top overlay_tactical_long x breakout_trend" in message
 
 
 def test_runtime_env_reloads_when_env_file_changes(monkeypatch, tmp_path):

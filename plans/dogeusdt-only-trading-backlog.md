@@ -49,6 +49,44 @@ Out of scope for this backlog:
 4. Block 4: Rebalance strategy hierarchy and connect macro to enforcement.
 5. Block 5: Clean the operational surface and expand test coverage.
 
+## Conservative Live Canary Runbook
+
+Goal: execute the first real DOGEUSDT canary with the full discipline path intact, keeping premium corroboration active and trade approval mandatory.
+
+Operating policy:
+
+- Keep `DOGE_PREMIUM_ANALYSIS_ENABLED=true`.
+- Keep `BINANCE_REQUIRE_TRADE_APPROVAL=true`.
+- Do not bypass the router or create manual entry proposals for the first canary.
+- Allow only one live canary at a time, with no existing DOGEUSDT position open.
+- Keep the canary at or below the current `BINANCE_RISK_MAX_NOTIONAL_USD` cap.
+
+Expected flow:
+
+1. Router/scout detects a valid candidate and emits a premium-pending WhatsApp message.
+2. Operator reviews the setup and triggers `ANALIZAR DOGE`.
+3. If premium passes, Hermes creates `Aprobacion requerida TRADE-...`.
+4. Operator verifies the exact trade state with `ESTADO TRADE-...` or `ESTADO DOGE`.
+5. Operator sends `APROBAR TRADE-...` only if the thesis is still valid and there is no conflicting operational risk.
+
+Abort conditions:
+
+- Premium returns rejection or `alto_riesgo`.
+- The trade approval expires before review.
+- Kill switch is active.
+- A DOGEUSDT position is already open.
+- Market structure changes materially between premium review and approval.
+
+Operator checklist for the first canary:
+
+- [ ] Confirm `kill_switch_active = false`.
+- [ ] Confirm no DOGEUSDT position is open.
+- [ ] Wait for the router-originated premium-pending message; do not front-run it manually.
+- [ ] Run `ANALIZAR DOGE`.
+- [ ] If premium passes, inspect `ESTADO TRADE-...` before approving.
+- [ ] Approve only one canary entry.
+- [ ] Monitor the resulting position through the standard status commands until closed.
+
 ---
 
 ## Block 1 - Harden Phase 2 Funding Arbitrage

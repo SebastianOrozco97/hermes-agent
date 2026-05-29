@@ -14,6 +14,7 @@ import uuid
 
 from hermes_constants import get_hermes_home
 from tools.binance_guardrails import BinanceAccountSnapshot, BinanceTradeProposal
+from tools.doge_regime_classifier import classify_decision_context_regime
 
 
 _DEFAULT_PAPER_BALANCE = Decimal("1000")
@@ -665,77 +666,116 @@ def _macro_direction_label(value: str) -> str:
 
 
 def _derive_strategy_regime_labels(decision_context: Mapping[str, Any]) -> tuple[list[str], str]:
+    classification = classify_decision_context_regime(decision_context)
+    return list(_unique_history_labels(classification.regime_tags)), classification.primary_regime
+
+
+def _median_decimal(values: Sequence[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / Decimal("2")
+
+
+def _median_int(values: Sequence[int]) -> Optional[int]:
+    if not values:
+        return None
+    ordered = sorted(int(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[midpoint]
+    return int((ordered[midpoint - 1] + ordered[midpoint]) / 2)
+
+
+def _new_history_bucket(*, include_regimes: bool = False) -> dict[str, Any]:
+    bucket: dict[str, Any] = {
+        "closed_positions": 0,
+        "wins": 0,
+        "losses": 0,
+        "flat": 0,
+        "realized_pnl_usd": Decimal("0"),
+        "realized_pnl_pct_total": Decimal("0"),
+        "outcomes": {},
+        "hold_seconds_values": [],
+        "drawdown_proxy_usd_values": [],
+        "drawdown_proxy_pct_values": [],
+        "approvals_requested": 0,
+        "approvals_approved": 0,
+        "approvals_denied": 0,
+        "approvals_converted": 0,
+        "approvals_consumed": 0,
+    }
+    if include_regimes:
+        bucket["regimes"] = {}
+    return bucket
+
+
+def _collect_converted_approval_ids(*, home: Optional[Path] = None) -> set[str]:
+    converted_ids: set[str] = set()
+    for event in _iter_jsonl(get_paper_journal_path(home=home)):
+        if event.get("event_type") not in {
+            "paper_position_opened",
+            "paper_position_closed",
+            "trade_approval_consumed",
+            "live_trade_executed",
+        }:
+            continue
+        approval_id = str(event.get("approval_id", "") or "").strip().upper()
+        if approval_id:
+            converted_ids.add(approval_id)
+    return converted_ids
+
+
+def _approval_history_record(
+    record: Mapping[str, Any],
+    *,
+    converted_approval_ids: set[str],
+) -> Optional[dict[str, Any]]:
+    timestamp = _parse_iso_datetime(str(record.get("created_at", "") or "").strip())
+    if timestamp is None:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+
+    raw_decision_context = record.get("decision_context") or {}
+    if not isinstance(raw_decision_context, Mapping):
+        raw_decision_context = {}
+    decision_context = _normalize_decision_context(raw_decision_context) or {}
     selected_strategy = decision_context.get("selected_strategy") or {}
     if not isinstance(selected_strategy, Mapping):
         selected_strategy = {}
-    market_context = decision_context.get("market_context") or {}
-    if not isinstance(market_context, Mapping):
-        market_context = {}
-    macro_state = decision_context.get("macro_state") or {}
-    if not isinstance(macro_state, Mapping):
-        macro_state = {}
 
-    strategy_regime_tags = _unique_history_labels(selected_strategy.get("regime_tags") or ())
-    market_regime_tags = _unique_history_labels(market_context.get("regime_tags") or ())
-    regime_labels = list(strategy_regime_tags)
-    for label in market_regime_tags:
-        if label not in regime_labels:
-            regime_labels.append(label)
+    approval_id = str(record.get("approval_id", "") or "").strip().upper()
+    strategy_id = str(
+        selected_strategy.get("strategy_id")
+        or decision_context.get("selected_strategy_id")
+        or "unknown"
+    ).strip().lower() or "unknown"
+    regime_labels, primary_regime = _derive_strategy_regime_labels(decision_context)
+    status = str(record.get("status", "") or "").strip().lower() or "unknown"
 
-    macro_alignment = _normalize_history_label(selected_strategy.get("macro_alignment"))
-    if macro_alignment:
-        label = f"macro_{macro_alignment}"
-        if label not in regime_labels:
-            regime_labels.append(label)
-
-    risk_level = _normalize_history_label(macro_state.get("risk_level"))
-    if risk_level:
-        label = f"risk_{risk_level}"
-        if label not in regime_labels:
-            regime_labels.append(label)
-
-    trend_1h = _normalize_history_label(macro_state.get("btc_trend_1h"))
-    trend_4h = _normalize_history_label(macro_state.get("btc_trend_4h"))
-    if trend_1h:
-        label = f"btc_1h_{trend_1h}"
-        if label not in regime_labels:
-            regime_labels.append(label)
-    if trend_4h:
-        label = f"btc_4h_{trend_4h}"
-        if label not in regime_labels:
-            regime_labels.append(label)
-
-    macro_direction_1h = _macro_direction_label(trend_1h)
-    macro_direction_4h = _macro_direction_label(trend_4h)
-    if macro_direction_1h and macro_direction_1h == macro_direction_4h:
-        macro_direction_label = f"{macro_direction_1h}_macro"
-        if macro_direction_label not in regime_labels:
-            regime_labels.append(macro_direction_label)
-    elif macro_direction_1h and macro_direction_4h and macro_direction_1h != macro_direction_4h:
-        if "mixed_macro" not in regime_labels:
-            regime_labels.append("mixed_macro")
-
-    primary_regime = "unknown"
-    preferred_strategy_tags = [
-        label
-        for label in strategy_regime_tags
-        if label not in {"directional_overlay", "range_capture", "delta_neutral"}
-        and not label.endswith("m")
-    ]
-    if preferred_strategy_tags:
-        primary_regime = preferred_strategy_tags[0]
-    elif strategy_regime_tags:
-        primary_regime = strategy_regime_tags[0]
-    elif "bearish_macro" in regime_labels:
-        primary_regime = "bearish_macro"
-    elif "bullish_macro" in regime_labels:
-        primary_regime = "bullish_macro"
-    elif macro_alignment:
-        primary_regime = f"macro_{macro_alignment}"
-    elif market_regime_tags:
-        primary_regime = market_regime_tags[0]
-
-    return regime_labels, primary_regime
+    return {
+        "approval_id": approval_id,
+        "symbol": str(record.get("symbol", "") or "").strip().upper(),
+        "strategy_id": strategy_id,
+        "primary_regime": primary_regime,
+        "regime_labels": regime_labels,
+        "macro_alignment": str(selected_strategy.get("macro_alignment", "") or "").strip().lower(),
+        "status": status,
+        "created_at": str(record.get("created_at", "") or "").strip(),
+        "decided_at": str(record.get("decided_at", "") or "").strip(),
+        "consumed_at": str(record.get("consumed_at", "") or "").strip(),
+        "converted": approval_id in converted_approval_ids,
+        "decision_context": dict(decision_context),
+        "_event_timestamp": timestamp,
+        "_normalized_strategy_id": _normalize_history_label(strategy_id),
+        "_normalized_regime_labels": _unique_history_labels(regime_labels),
+    }
 
 
 def _strategy_history_record(event: Mapping[str, Any]) -> Optional[dict[str, Any]]:
@@ -764,6 +804,7 @@ def _strategy_history_record(event: Mapping[str, Any]) -> Optional[dict[str, Any
 
     return {
         "position_id": str(event.get("position_id", "") or "").strip(),
+        "approval_id": str(event.get("approval_id", "") or "").strip().upper(),
         "symbol": str(event.get("symbol", "") or "").strip().upper(),
         "strategy_id": strategy_id,
         "primary_regime": primary_regime,
@@ -775,8 +816,14 @@ def _strategy_history_record(event: Mapping[str, Any]) -> Optional[dict[str, Any
         "selector_family": str(decision_context.get("selector_family", "") or "").strip(),
         "opened_at": str(event.get("opened_at", "") or "").strip(),
         "closed_at": str(event.get("closed_at", "") or "").strip(),
+        "notional_usd": str(event.get("notional_usd", "0") or "0").strip(),
         "realized_pnl_usd": str(event.get("realized_pnl_usd", "0") or "0").strip(),
         "realized_pnl_pct": str(event.get("realized_pnl_pct", "") or "").strip(),
+        "duration_seconds": event.get("duration_seconds"),
+        "duration_human": str(event.get("duration_human", "") or "").strip() or None,
+        "estimated_max_loss_usd": str(event.get("estimated_max_loss_usd", "0") or "0").strip(),
+        "estimated_max_profit_usd": str(event.get("estimated_max_profit_usd", "0") or "0").strip(),
+        "risk_reward_ratio": str(event.get("risk_reward_ratio", "") or "").strip(),
         "trigger": str(event.get("trigger", "") or "").strip(),
         "trigger_category": str(event.get("trigger_category", "") or "").strip(),
         "thesis_outcome": thesis_outcome,
@@ -853,8 +900,10 @@ def get_paper_strategy_history(
 
 def _update_history_bucket(bucket: dict[str, Any], record: Mapping[str, Any]) -> None:
     pnl = _parse_decimal(record.get("realized_pnl_usd", "0"), "realized_pnl_usd")
+    pnl_pct = _parse_decimal(record.get("realized_pnl_pct", "0") or "0", "realized_pnl_pct")
     bucket["closed_positions"] += 1
     bucket["realized_pnl_usd"] += pnl
+    bucket["realized_pnl_pct_total"] += pnl_pct
     if pnl > 0:
         bucket["wins"] += 1
     elif pnl < 0:
@@ -863,6 +912,33 @@ def _update_history_bucket(bucket: dict[str, Any], record: Mapping[str, Any]) ->
         bucket["flat"] += 1
     outcome = str(record.get("thesis_outcome", "") or "").strip().lower() or "unknown"
     bucket["outcomes"][outcome] = bucket["outcomes"].get(outcome, 0) + 1
+    duration_seconds = record.get("duration_seconds")
+    if isinstance(duration_seconds, int):
+        bucket["hold_seconds_values"].append(duration_seconds)
+    elif duration_seconds not in (None, ""):
+        try:
+            bucket["hold_seconds_values"].append(int(duration_seconds))
+        except (TypeError, ValueError):
+            pass
+
+    drawdown_proxy_usd = _parse_decimal(record.get("estimated_max_loss_usd", "0") or "0", "estimated_max_loss_usd")
+    bucket["drawdown_proxy_usd_values"].append(drawdown_proxy_usd)
+    notional_usd = _parse_decimal(record.get("notional_usd", "0") or "0", "notional_usd")
+    if notional_usd > 0:
+        bucket["drawdown_proxy_pct_values"].append((drawdown_proxy_usd / notional_usd) * Decimal("100"))
+
+
+def _update_approval_bucket(bucket: dict[str, Any], record: Mapping[str, Any]) -> None:
+    status = str(record.get("status", "") or "").strip().lower()
+    bucket["approvals_requested"] += 1
+    if status in {"approved", "consumed"}:
+        bucket["approvals_approved"] += 1
+    elif status == "denied":
+        bucket["approvals_denied"] += 1
+    if bool(record.get("converted")):
+        bucket["approvals_converted"] += 1
+    if status == "consumed":
+        bucket["approvals_consumed"] += 1
 
 
 def _finalize_history_bucket(
@@ -871,25 +947,59 @@ def _finalize_history_bucket(
     bucket: Mapping[str, Any],
     *,
     regimes: Optional[list[dict[str, Any]]] = None,
+    extras: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     closed_positions = int(bucket.get("closed_positions", 0) or 0)
     wins = int(bucket.get("wins", 0) or 0)
     realized_pnl_usd = Decimal(bucket.get("realized_pnl_usd", Decimal("0")))
     avg_realized_pnl = realized_pnl_usd / Decimal(closed_positions) if closed_positions else Decimal("0")
+    realized_pnl_pct_total = Decimal(bucket.get("realized_pnl_pct_total", Decimal("0")))
+    expectancy_pct = realized_pnl_pct_total / Decimal(closed_positions) if closed_positions else Decimal("0")
     win_rate_pct = Decimal("0")
     if closed_positions:
         win_rate_pct = (Decimal(wins) / Decimal(closed_positions)) * Decimal("100")
+    approvals_requested = int(bucket.get("approvals_requested", 0) or 0)
+    approvals_approved = int(bucket.get("approvals_approved", 0) or 0)
+    approvals_denied = int(bucket.get("approvals_denied", 0) or 0)
+    approvals_converted = int(bucket.get("approvals_converted", 0) or 0)
+    approvals_consumed = int(bucket.get("approvals_consumed", 0) or 0)
+    approval_conversion_pct = Decimal("0")
+    approval_approval_pct = Decimal("0")
+    if approvals_requested:
+        approval_conversion_pct = (Decimal(approvals_converted) / Decimal(approvals_requested)) * Decimal("100")
+        approval_approval_pct = (Decimal(approvals_approved) / Decimal(approvals_requested)) * Decimal("100")
+    median_hold_seconds = _median_int(list(bucket.get("hold_seconds_values") or ()))
+    median_hold_human = _format_duration_seconds(median_hold_seconds) if median_hold_seconds is not None else None
+    median_drawdown_proxy_usd = _median_decimal(list(bucket.get("drawdown_proxy_usd_values") or ()))
+    median_drawdown_proxy_pct = _median_decimal(list(bucket.get("drawdown_proxy_pct_values") or ()))
     finalized = {
         key_name: key_value,
+        "sample_count": closed_positions,
         "closed_positions": closed_positions,
         "wins": wins,
         "losses": int(bucket.get("losses", 0) or 0),
         "flat": int(bucket.get("flat", 0) or 0),
+        "hit_rate_pct": _decimal_to_str(win_rate_pct),
         "win_rate_pct": _decimal_to_str(win_rate_pct),
         "realized_pnl_usd": _decimal_to_str(realized_pnl_usd),
+        "expectancy_usd": _decimal_to_str(avg_realized_pnl),
+        "expectancy_pct": _decimal_to_str(expectancy_pct),
         "avg_realized_pnl_usd": _decimal_to_str(avg_realized_pnl),
+        "median_hold_seconds": median_hold_seconds,
+        "median_hold_human": median_hold_human,
+        "median_drawdown_proxy_usd": _decimal_to_str(median_drawdown_proxy_usd),
+        "median_drawdown_proxy_pct": _decimal_to_str(median_drawdown_proxy_pct),
+        "approvals_requested": approvals_requested,
+        "approvals_approved": approvals_approved,
+        "approvals_denied": approvals_denied,
+        "approvals_converted": approvals_converted,
+        "approvals_consumed": approvals_consumed,
+        "approval_conversion_pct": _decimal_to_str(approval_conversion_pct),
+        "approval_approval_pct": _decimal_to_str(approval_approval_pct),
         "outcomes": dict(bucket.get("outcomes", {})),
     }
+    if extras:
+        finalized.update(dict(extras))
     if regimes is not None:
         finalized["regimes"] = regimes
     return finalized
@@ -923,16 +1033,18 @@ def get_paper_strategy_history_summary(
         home=home,
     )
 
-    total_bucket = {
-        "closed_positions": 0,
-        "wins": 0,
-        "losses": 0,
-        "flat": 0,
-        "realized_pnl_usd": Decimal("0"),
-        "outcomes": {},
-    }
+    filters = history["filters"]
+    normalized_symbol = str(filters.get("symbol", "") or "").strip().upper()
+    normalized_strategy_id = _normalize_history_label(filters.get("strategy_id", ""))
+    normalized_regime = _normalize_history_label(filters.get("regime", ""))
+    normalized_outcome = _normalize_history_label(filters.get("outcome", ""))
+    start_boundary = _parse_history_boundary(filters.get("start_date", ""), end=False)
+    end_boundary = _parse_history_boundary(filters.get("end_date", ""), end=True)
+
+    total_bucket = _new_history_bucket()
     strategy_buckets: dict[str, dict[str, Any]] = {}
     regime_buckets: dict[str, dict[str, Any]] = {}
+    pair_buckets: dict[tuple[str, str], dict[str, Any]] = {}
 
     for record in history["records"]:
         _update_history_bucket(total_bucket, record)
@@ -940,44 +1052,67 @@ def get_paper_strategy_history_summary(
         normalized_strategy = str(record.get("strategy_id", "") or "").strip().lower() or "unknown"
         strategy_bucket = strategy_buckets.setdefault(
             normalized_strategy,
-            {
-                "closed_positions": 0,
-                "wins": 0,
-                "losses": 0,
-                "flat": 0,
-                "realized_pnl_usd": Decimal("0"),
-                "outcomes": {},
-                "regimes": {},
-            },
+            _new_history_bucket(include_regimes=True),
         )
         _update_history_bucket(strategy_bucket, record)
 
         primary_regime = str(record.get("primary_regime", "") or "").strip().lower() or "unknown"
         overall_regime_bucket = regime_buckets.setdefault(
             primary_regime,
-            {
-                "closed_positions": 0,
-                "wins": 0,
-                "losses": 0,
-                "flat": 0,
-                "realized_pnl_usd": Decimal("0"),
-                "outcomes": {},
-            },
+            _new_history_bucket(),
         )
         _update_history_bucket(overall_regime_bucket, record)
 
         per_strategy_regime_bucket = strategy_bucket["regimes"].setdefault(
             primary_regime,
-            {
-                "closed_positions": 0,
-                "wins": 0,
-                "losses": 0,
-                "flat": 0,
-                "realized_pnl_usd": Decimal("0"),
-                "outcomes": {},
-            },
+            _new_history_bucket(),
         )
         _update_history_bucket(per_strategy_regime_bucket, record)
+
+        pair_bucket = pair_buckets.setdefault((normalized_strategy, primary_regime), _new_history_bucket())
+        _update_history_bucket(pair_bucket, record)
+
+    converted_approval_ids = _collect_converted_approval_ids(home=home)
+    matching_approval_ids = {
+        str(record.get("approval_id", "") or "").strip().upper()
+        for record in history["records"]
+        if str(record.get("approval_id", "") or "").strip()
+    }
+    approvals_payload = _load_approvals(home=home)
+    for approval_store_record in approvals_payload.get("approvals", []):
+        approval_record = _approval_history_record(
+            approval_store_record,
+            converted_approval_ids=converted_approval_ids,
+        )
+        if approval_record is None:
+            continue
+        if normalized_symbol and approval_record["symbol"] != normalized_symbol:
+            continue
+        if normalized_strategy_id and approval_record["_normalized_strategy_id"] != normalized_strategy_id:
+            continue
+        if normalized_regime and normalized_regime not in approval_record["_normalized_regime_labels"]:
+            continue
+        timestamp = approval_record["_event_timestamp"]
+        if start_boundary is not None and timestamp < start_boundary:
+            continue
+        if end_boundary is not None and timestamp > end_boundary:
+            continue
+        if normalized_outcome:
+            approval_id = str(approval_record.get("approval_id", "") or "").strip().upper()
+            if not approval_id or approval_id not in matching_approval_ids:
+                continue
+
+        _update_approval_bucket(total_bucket, approval_record)
+        normalized_strategy = str(approval_record.get("strategy_id", "") or "").strip().lower() or "unknown"
+        primary_regime = str(approval_record.get("primary_regime", "") or "").strip().lower() or "unknown"
+        strategy_bucket = strategy_buckets.setdefault(normalized_strategy, _new_history_bucket(include_regimes=True))
+        _update_approval_bucket(strategy_bucket, approval_record)
+        overall_regime_bucket = regime_buckets.setdefault(primary_regime, _new_history_bucket())
+        _update_approval_bucket(overall_regime_bucket, approval_record)
+        per_strategy_regime_bucket = strategy_bucket["regimes"].setdefault(primary_regime, _new_history_bucket())
+        _update_approval_bucket(per_strategy_regime_bucket, approval_record)
+        pair_bucket = pair_buckets.setdefault((normalized_strategy, primary_regime), _new_history_bucket())
+        _update_approval_bucket(pair_bucket, approval_record)
 
     finalized_strategies: list[dict[str, Any]] = []
     for normalized_strategy, bucket in strategy_buckets.items():
@@ -1002,6 +1137,25 @@ def get_paper_strategy_history_summary(
     ]
     finalized_regimes.sort(key=lambda item: _history_bucket_sort_key(item, "regime_label"))
 
+    finalized_pairs = [
+        _finalize_history_bucket(
+            "strategy_id",
+            strategy_id_value,
+            bucket,
+            extras={"regime_label": regime_label},
+        )
+        for (strategy_id_value, regime_label), bucket in pair_buckets.items()
+    ]
+    finalized_pairs.sort(
+        key=lambda item: (
+            -int(item.get("closed_positions", 0) or 0),
+            -int(item.get("approvals_requested", 0) or 0),
+            -_parse_decimal(item.get("realized_pnl_usd", "0"), "realized_pnl_usd"),
+            str(item.get("strategy_id", "") or ""),
+            str(item.get("regime_label", "") or ""),
+        )
+    )
+
     summary = _finalize_history_bucket("scope", "overall", total_bucket)
     summary.update(
         {
@@ -1010,6 +1164,7 @@ def get_paper_strategy_history_summary(
             "total_matches": history["total_matches"],
             "strategies": finalized_strategies,
             "regimes": finalized_regimes,
+            "strategy_regime_pairs": finalized_pairs,
         }
     )
     summary.pop("scope", None)
@@ -1082,6 +1237,12 @@ def get_paper_daily_summary(summary_date: str = "", *, home: Optional[Path] = No
         "entries": entries,
         "exits": exits,
         "strategy_scorecard": get_paper_strategy_history_summary(
+            start_date=wanted_date,
+            end_date=wanted_date,
+            home=home,
+        ),
+        "doge_strategy_scorecard": get_paper_strategy_history_summary(
+            symbol="DOGEUSDT",
             start_date=wanted_date,
             end_date=wanted_date,
             home=home,
@@ -1609,6 +1770,36 @@ def record_live_trade_protection_adjustment(
         "premium_request_id": str((premium_request or {}).get("request_id") or "").strip() or None,
         "premium_assessment": _normalize_json_payload(premium_assessment) if premium_assessment else None,
         "decision_context": _normalize_decision_context(decision_context),
+    }
+    _append_jsonl(get_paper_journal_path(home=home), record)
+    return record
+
+
+def record_doge_strategy_router_cycle(
+    *,
+    status: str,
+    requested_via: str,
+    decision_context: Optional[Mapping[str, Any]] = None,
+    lines: Sequence[str] = (),
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    normalized_decision_context = _normalize_decision_context(decision_context)
+    selected_strategy = (normalized_decision_context or {}).get("selected_strategy") or {}
+    if not isinstance(selected_strategy, Mapping):
+        selected_strategy = {}
+    record = {
+        "event_type": "doge_strategy_router_cycle",
+        "recorded_at": _now_iso(),
+        "status": str(status or "").strip().lower() or "unknown",
+        "requested_via": str(requested_via or "").strip() or "doge_strategy_router",
+        "symbol": str((selected_strategy or {}).get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT",
+        "selected_strategy_id": str(
+            selected_strategy.get("strategy_id")
+            or (normalized_decision_context or {}).get("selected_strategy_id")
+            or "unknown"
+        ).strip().lower() or "unknown",
+        "decision_context": normalized_decision_context,
+        "lines": _normalize_json_payload(list(lines or ())),
     }
     _append_jsonl(get_paper_journal_path(home=home), record)
     return record

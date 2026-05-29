@@ -8,7 +8,9 @@ from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
 from tools.doge_grid_advisor import plan_dynamic_grid
 from tools.doge_signal_engine import DogeSignalSnapshot
 from tools.doge_strategy_selector import (
+    SelectorFeedbackPolicy,
     StrategyOpportunity,
+    attach_selector_feedback,
     arbitrage_opportunity_from_plan,
     build_no_trade_opportunity,
     grid_opportunity_from_plan,
@@ -47,6 +49,7 @@ def _synthetic_opportunity(
     macro_alignment: str = "aligned",
     blockers: tuple[str, ...] = (),
     diagnostic_payload: dict[str, object] | None = None,
+    primary_regime: str = "unknown",
 ) -> StrategyOpportunity:
     return StrategyOpportunity(
         strategy_id=strategy_id,
@@ -62,7 +65,39 @@ def _synthetic_opportunity(
         regime_tags=(strategy_id,),
         operator_summary=f"{strategy_id} summary",
         diagnostic_payload=diagnostic_payload or {},
+        primary_regime=primary_regime,
     )
+
+
+def _scorecard_pair(
+    *,
+    strategy_id: str,
+    regime_label: str,
+    sample_count: int,
+    approvals_requested: int,
+    approval_conversion_pct: str,
+    expectancy_usd: str,
+    hit_rate_pct: str = "50",
+    realized_pnl_usd: str = "0",
+) -> dict[str, object]:
+    return {
+        "strategy_id": strategy_id,
+        "regime_label": regime_label,
+        "sample_count": sample_count,
+        "approvals_requested": approvals_requested,
+        "approval_conversion_pct": approval_conversion_pct,
+        "expectancy_usd": expectancy_usd,
+        "hit_rate_pct": hit_rate_pct,
+        "realized_pnl_usd": realized_pnl_usd,
+    }
+
+
+def _scorecard_summary(*pairs: dict[str, object]) -> dict[str, object]:
+    return {
+        "start_date": "2026-05-15",
+        "end_date": "2026-05-28",
+        "strategy_regime_pairs": list(pairs),
+    }
 
 
 def test_overlay_opportunity_maps_candidate_signal():
@@ -78,6 +113,7 @@ def test_overlay_opportunity_maps_candidate_signal():
     assert opportunity.expected_edge == pytest.approx(Decimal("0.8571428571428571428571428571"))
     assert opportunity.confidence == Decimal("0.81")
     assert opportunity.capital_required_usd == Decimal("5.25")
+    assert opportunity.primary_regime == "breakout_trend"
     assert "breakout_pressure" in opportunity.regime_tags
     assert "volume_confirmed" in opportunity.regime_tags
     assert opportunity.macro_alignment == "aligned"
@@ -109,6 +145,7 @@ def test_arbitrage_opportunity_maps_entry_plan():
     assert opportunity.eligible is True
     assert opportunity.strategy_id == "funding_arbitrage"
     assert opportunity.action == "enter_arbitrage"
+    assert opportunity.primary_regime == "funding_rich_carry"
     assert opportunity.capital_required_usd == pytest.approx(Decimal("10"))
     assert opportunity.diagnostic_payload["expected_yield_pct"] == "0.2"
     assert "delta_neutral" in opportunity.regime_tags
@@ -145,6 +182,7 @@ def test_grid_opportunity_maps_range_regime():
     assert opportunity.eligible is True
     assert opportunity.strategy_id == "atr_grid"
     assert opportunity.action == "seed_grid"
+    assert opportunity.primary_regime == "quiet_range"
     assert opportunity.expected_edge == Decimal("0.60")
     assert opportunity.confidence == Decimal("0.70")
     assert "range_bound" in opportunity.regime_tags
@@ -180,6 +218,7 @@ def test_build_no_trade_opportunity_requires_blocker_and_zero_capital():
     assert isinstance(opportunity, StrategyOpportunity)
     assert opportunity.strategy_id == "no_trade"
     assert opportunity.eligible is False
+    assert opportunity.primary_regime == "high_volatility_stress"
     assert opportunity.capital_required_usd == Decimal("0")
     assert opportunity.confidence == Decimal("1")
     assert opportunity.blockers == ("macro and regime are both hostile",)
@@ -291,3 +330,127 @@ def test_selector_abstains_when_sample_size_gate_is_missing():
     assert selection.abstained is True
     assert selection.chosen_strategy_id == "no_trade"
     assert "funding_arbitrage: sample size gate is not ready" in selection.chosen_opportunity.blockers
+
+
+def test_selector_feedback_shadow_records_rank_flip_without_changing_live_selection():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.70",
+        confidence="0.70",
+        primary_regime="breakout_trend",
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        expected_edge="0.68",
+        confidence="0.68",
+        primary_regime="quiet_range",
+    )
+
+    base_selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.01"))
+    feedback_selection = attach_selector_feedback(
+        base_selection,
+        scorecard_summary=_scorecard_summary(
+            _scorecard_pair(
+                strategy_id="overlay_tactical_long",
+                regime_label="breakout_trend",
+                sample_count=8,
+                approvals_requested=8,
+                approval_conversion_pct="25",
+                expectancy_usd="-0.12",
+                realized_pnl_usd="-1.20",
+            ),
+            _scorecard_pair(
+                strategy_id="atr_grid",
+                regime_label="quiet_range",
+                sample_count=8,
+                approvals_requested=8,
+                approval_conversion_pct="75",
+                expectancy_usd="0.20",
+                realized_pnl_usd="1.60",
+            ),
+        ),
+        policy=SelectorFeedbackPolicy(mode="shadow"),
+        conflict_margin=Decimal("0.01"),
+    )
+
+    assert base_selection.chosen_strategy_id == "overlay_tactical_long"
+    assert feedback_selection.chosen_strategy_id == "overlay_tactical_long"
+    assert feedback_selection.feedback_result is not None
+    assert feedback_selection.feedback_result.shadow_chosen_strategy_id == "atr_grid"
+    assert feedback_selection.feedback_result.shadow_would_change_selection is True
+    assert feedback_selection.feedback_result.evaluations[0].policy_action in {"penalize", "boost"}
+
+
+def test_selector_feedback_shadow_would_abstain_under_persistent_negative_evidence():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.70",
+        confidence="0.72",
+        primary_regime="breakout_trend",
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        eligible=False,
+        blockers=("trend regime blocks the grid",),
+        primary_regime="quiet_range",
+    )
+
+    base_selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.01"))
+    feedback_selection = attach_selector_feedback(
+        base_selection,
+        scorecard_summary=_scorecard_summary(
+            _scorecard_pair(
+                strategy_id="overlay_tactical_long",
+                regime_label="breakout_trend",
+                sample_count=10,
+                approvals_requested=10,
+                approval_conversion_pct="20",
+                expectancy_usd="-0.20",
+                realized_pnl_usd="-2.00",
+            )
+        ),
+        policy=SelectorFeedbackPolicy(mode="shadow"),
+    )
+
+    assert base_selection.chosen_strategy_id == "overlay_tactical_long"
+    assert feedback_selection.feedback_result is not None
+    assert feedback_selection.feedback_result.shadow_abstained is True
+    assert feedback_selection.feedback_result.shadow_chosen_strategy_id == "no_trade"
+    assert "every strategy lane is blocked or incomplete" in feedback_selection.feedback_result.shadow_abstain_reason
+
+
+def test_selector_feedback_shadow_keeps_selection_when_samples_are_insufficient():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.70",
+        confidence="0.70",
+        primary_regime="breakout_trend",
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        expected_edge="0.65",
+        confidence="0.66",
+        primary_regime="quiet_range",
+    )
+
+    base_selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.01"))
+    feedback_selection = attach_selector_feedback(
+        base_selection,
+        scorecard_summary=_scorecard_summary(
+            _scorecard_pair(
+                strategy_id="overlay_tactical_long",
+                regime_label="breakout_trend",
+                sample_count=2,
+                approvals_requested=2,
+                approval_conversion_pct="100",
+                expectancy_usd="0.80",
+            )
+        ),
+        policy=SelectorFeedbackPolicy(mode="shadow"),
+        conflict_margin=Decimal("0.01"),
+    )
+
+    assert feedback_selection.feedback_result is not None
+    assert feedback_selection.feedback_result.shadow_chosen_strategy_id == base_selection.chosen_strategy_id
+    assert feedback_selection.feedback_result.shadow_would_change_selection is False
+    assert any(item.policy_action == "insufficient_sample" for item in feedback_selection.feedback_result.evaluations)

@@ -935,6 +935,7 @@ def _build_paper_status_whatsapp_message(status: dict[str, Any]) -> str:
 
 def _build_paper_daily_summary_whatsapp_message(summary: dict[str, Any]) -> str:
     open_positions = summary.get("open_positions") or []
+    doge_scorecard = summary.get("doge_strategy_scorecard") or {}
     lines = [
         f"Resumen paper {summary.get('date') or 'n/d'}",
         (
@@ -955,6 +956,27 @@ def _build_paper_daily_summary_whatsapp_message(summary: dict[str, Any]) -> str:
         if preview:
             suffix = "..." if len(open_positions) > 3 else ""
             lines.append(f"Abiertas: {preview}{suffix}")
+    if isinstance(doge_scorecard, dict) and int(doge_scorecard.get("total_matches", 0) or 0) > 0:
+        top_pair = None
+        for candidate in list(doge_scorecard.get("strategy_regime_pairs") or []):
+            if isinstance(candidate, dict):
+                top_pair = candidate
+                break
+        preview_parts = [
+            (
+                f"DOGE conv {doge_scorecard.get('approval_conversion_pct', '0')}% | "
+                f"expectancy {_format_usd_text(doge_scorecard.get('expectancy_usd') or '0')} USD | "
+                f"hold med {str(doge_scorecard.get('median_hold_human', '') or 'n/d').strip() or 'n/d'}"
+            )
+        ]
+        if top_pair is not None:
+            preview_parts.append(
+                (
+                    f"top {str(top_pair.get('strategy_id', '') or 'unknown').strip()} x "
+                    f"{str(top_pair.get('regime_label', '') or 'unknown').strip()}"
+                )
+            )
+        lines.append("Scorecard: " + " | ".join(preview_parts))
     return "\n".join(lines)
 
 

@@ -18,6 +18,7 @@ from tools.binance_paper_runtime import (
     open_paper_position,
     reconcile_protective_exits,
     record_doge_premium_analysis_decision,
+    record_doge_strategy_router_cycle,
     record_live_trade_execution_failure,
     record_live_trade_execution_success,
     record_live_trade_protection_adjustment,
@@ -53,6 +54,7 @@ def _decision_context(
     *,
     strategy_id: str,
     regime_tags: tuple[str, ...],
+    primary_regime: str = "",
     macro_alignment: str = "aligned",
     risk_level: str = "normal",
     btc_trend_1h: str = "bullish",
@@ -68,6 +70,7 @@ def _decision_context(
             "capital_required_usd": "20",
             "holding_horizon": "30-90m",
             "macro_alignment": macro_alignment,
+            "primary_regime": primary_regime,
             "regime_tags": list(regime_tags),
         },
         "alternatives_considered": [],
@@ -329,6 +332,36 @@ def test_record_live_trade_protection_adjustment_appends_structured_journal_even
     assert payload["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
 
 
+def test_record_doge_strategy_router_cycle_appends_structured_journal_event(tmp_path):
+    record = record_doge_strategy_router_cycle(
+        status="selector_blocked",
+        requested_via="cron_15m_doge_router",
+        decision_context={
+            "selected_strategy_id": "overlay_tactical_long",
+            "selected_strategy": {
+                "strategy_id": "overlay_tactical_long",
+                "primary_regime": "breakout_trend",
+            },
+            "selector_feedback": {
+                "policy": {"mode": "shadow"},
+                "shadow_selection": {"chosen_strategy_id": "atr_grid", "abstained": False},
+            },
+        },
+        lines=["DOGE STRATEGY ROUTER (DOGEUSDT)", "Shadow feedback: habria priorizado ATR grid."],
+        home=tmp_path,
+    )
+
+    journal_lines = get_paper_journal_path(home=tmp_path).read_text(encoding="utf-8").splitlines()
+    payload = json.loads(journal_lines[-1])
+
+    assert record["event_type"] == "doge_strategy_router_cycle"
+    assert payload["event_type"] == "doge_strategy_router_cycle"
+    assert payload["status"] == "selector_blocked"
+    assert payload["requested_via"] == "cron_15m_doge_router"
+    assert payload["selected_strategy_id"] == "overlay_tactical_long"
+    assert payload["decision_context"]["selector_feedback"]["policy"]["mode"] == "shadow"
+
+
 def test_trade_approval_persists_decision_context_on_record_and_journal(tmp_path):
     decision_context = {
         "selected_strategy": {
@@ -490,6 +523,7 @@ def test_daily_summary_reports_entries_exits_and_pnl(tmp_path):
     assert summary["realized_pnl_usd"] == "0.2"
     assert summary["exits"][0]["thesis_outcome"] == "managed_profit"
     assert summary["strategy_scorecard"]["total_matches"] == 1
+    assert summary["doge_strategy_scorecard"]["total_matches"] == 1
 
 
 def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp_path):
@@ -502,6 +536,7 @@ def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp
         decision_context=_decision_context(
             strategy_id="overlay_tactical_long",
             regime_tags=("directional_overlay", "breakout_pressure", "trend_supportive"),
+            primary_regime="breakout_trend",
             btc_trend_1h="bullish",
             btc_trend_4h="bullish",
         ),
@@ -523,6 +558,7 @@ def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp
         decision_context=_decision_context(
             strategy_id="overlay_tactical_long",
             regime_tags=("directional_overlay", "breakout_pressure"),
+            primary_regime="macro_divergent_chop",
             macro_alignment="cautious",
             risk_level="elevated",
             btc_trend_1h="bearish",
@@ -546,6 +582,7 @@ def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp
         decision_context=_decision_context(
             strategy_id="atr_grid",
             regime_tags=("range_capture", "range_bound"),
+            primary_regime="quiet_range",
             btc_trend_1h="flat",
             btc_trend_4h="flat",
         ),
@@ -567,7 +604,7 @@ def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp
     bullish_history = get_paper_strategy_history(
         symbol="DOGEUSDT",
         strategy_id="overlay_tactical_long",
-        regime="bullish_macro",
+        regime="breakout_trend",
         outcome="validated",
         start_date=today,
         end_date=today,
@@ -576,7 +613,7 @@ def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp
     bearish_history = get_paper_strategy_history(
         symbol="DOGEUSDT",
         strategy_id="overlay_tactical_long",
-        regime="bearish_macro",
+        regime="macro_divergent_chop",
         outcome="invalidated",
         start_date=yesterday,
         end_date=yesterday,
@@ -585,10 +622,10 @@ def test_get_paper_strategy_history_filters_strategy_regime_outcome_and_date(tmp
 
     assert bullish_history["total_matches"] == 1
     assert bullish_history["records"][0]["position_id"] == bullish_overlay["position"]["position_id"]
-    assert bullish_history["records"][0]["primary_regime"] == "breakout_pressure"
+    assert bullish_history["records"][0]["primary_regime"] == "breakout_trend"
     assert bearish_history["total_matches"] == 1
     assert bearish_history["records"][0]["position_id"] == bearish_overlay["position"]["position_id"]
-    assert "bearish_macro" in bearish_history["records"][0]["regime_labels"]
+    assert "macro_divergent_chop" in bearish_history["records"][0]["regime_labels"]
 
 
 def test_get_paper_strategy_history_summary_groups_by_strategy_and_regime(tmp_path):
@@ -601,6 +638,7 @@ def test_get_paper_strategy_history_summary_groups_by_strategy_and_regime(tmp_pa
         decision_context=_decision_context(
             strategy_id="overlay_tactical_long",
             regime_tags=("directional_overlay", "breakout_pressure", "trend_supportive"),
+            primary_regime="breakout_trend",
         ),
         home=tmp_path,
     )
@@ -620,6 +658,7 @@ def test_get_paper_strategy_history_summary_groups_by_strategy_and_regime(tmp_pa
         decision_context=_decision_context(
             strategy_id="atr_grid",
             regime_tags=("range_capture", "range_bound"),
+            primary_regime="quiet_range",
             btc_trend_1h="flat",
             btc_trend_4h="flat",
         ),
@@ -640,6 +679,67 @@ def test_get_paper_strategy_history_summary_groups_by_strategy_and_regime(tmp_pa
     overlay_summary = next(item for item in summary["strategies"] if item["strategy_id"] == "overlay_tactical_long")
     grid_summary = next(item for item in summary["strategies"] if item["strategy_id"] == "atr_grid")
     assert overlay_summary["wins"] == 1
-    assert overlay_summary["regimes"][0]["regime_label"] == "breakout_pressure"
+    assert overlay_summary["regimes"][0]["regime_label"] == "breakout_trend"
     assert grid_summary["losses"] == 1
-    assert any(item["regime_label"] == "range_bound" for item in summary["regimes"])
+    assert any(item["regime_label"] == "quiet_range" for item in summary["regimes"])
+
+
+def test_get_paper_strategy_history_summary_adds_approval_conversion_and_pair_metrics(tmp_path):
+    seed_paper_account(Decimal("1000"), reset=True, home=tmp_path)
+
+    winning_context = _decision_context(
+        strategy_id="overlay_tactical_long",
+        regime_tags=("directional_overlay", "breakout_pressure", "trend_supportive"),
+        primary_regime="breakout_trend",
+    )
+    losing_context = _decision_context(
+        strategy_id="overlay_tactical_long",
+        regime_tags=("directional_overlay", "breakout_pressure"),
+        primary_regime="macro_divergent_chop",
+        macro_alignment="cautious",
+        risk_level="elevated",
+        btc_trend_1h="bearish",
+        btc_trend_4h="bearish",
+    )
+
+    approved = request_trade_approval(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        decision_context=winning_context,
+        home=tmp_path,
+    )
+    denied = request_trade_approval(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        decision_context=losing_context,
+        home=tmp_path,
+    )
+    record_trade_approval(approved["approval_id"], decision="approve", home=tmp_path)
+    record_trade_approval(denied["approval_id"], decision="deny", home=tmp_path)
+
+    opened = open_paper_position(
+        _proposal(symbol="DOGEUSDT", notional_usd="20", stop_loss_pct="0.5", take_profit_pct="1.0"),
+        reference_price=Decimal("0.1043"),
+        approval_id=approved["approval_id"],
+        decision_context=winning_context,
+        home=tmp_path,
+    )
+    close_paper_position(
+        opened["position"]["position_id"],
+        exit_price=Decimal("0.105343"),
+        reason="take profit reached",
+        trigger="take_profit",
+        thesis_outcome="validated",
+        home=tmp_path,
+    )
+
+    summary = get_paper_strategy_history_summary(symbol="DOGEUSDT", home=tmp_path)
+
+    assert summary["approvals_requested"] == 2
+    assert summary["approvals_approved"] == 1
+    assert summary["approvals_denied"] == 1
+    assert summary["approvals_converted"] == 1
+    assert summary["approval_conversion_pct"] == "50"
+    assert summary["expectancy_usd"] == "0.2"
+    assert summary["median_hold_seconds"] is not None
+    assert summary["median_drawdown_proxy_usd"] == "0.1"
+    assert summary["strategy_regime_pairs"][0]["strategy_id"] == "overlay_tactical_long"
+    assert summary["strategy_regime_pairs"][0]["regime_label"] == "breakout_trend"

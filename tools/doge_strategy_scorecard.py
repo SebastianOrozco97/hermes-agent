@@ -80,8 +80,23 @@ def build_doge_strategy_scorecard_lines(scorecard: dict[str, object]) -> list[st
         return lines
 
     lines.append(
-        f"Cierres {total_matches} | PnL {scorecard.get('realized_pnl_usd', '0')} USD | win rate {scorecard.get('win_rate_pct', '0')}%"
+        (
+            f"Cierres {total_matches} | conv {scorecard.get('approval_conversion_pct', '0')}% | "
+            f"PnL {scorecard.get('realized_pnl_usd', '0')} USD | expectancy {scorecard.get('expectancy_usd', '0')} USD | "
+            f"win rate {scorecard.get('win_rate_pct', '0')}% | hold med {scorecard.get('median_hold_human') or 'n/d'}"
+        )
     )
+    pairs = [item for item in list(scorecard.get("strategy_regime_pairs") or []) if isinstance(item, dict)]
+    if pairs:
+        lead_pair = pairs[0]
+        lines.append(
+            (
+                f"Pareja lider {_strategy_label(str(lead_pair.get('strategy_id', '') or ''))} x "
+                f"{str(lead_pair.get('regime_label', '') or '').strip() or 'unknown'} | "
+                f"muestra {lead_pair.get('sample_count', 0)} | conv {lead_pair.get('approval_conversion_pct', '0')}% | "
+                f"expectancy {lead_pair.get('expectancy_usd', '0')} USD"
+            )
+        )
     for strategy in list(scorecard.get("strategies") or [])[:3]:
         if not isinstance(strategy, dict):
             continue
@@ -91,6 +106,10 @@ def build_doge_strategy_scorecard_lines(scorecard: dict[str, object]) -> list[st
         if regimes and isinstance(regimes[0], dict):
             top_regime = str(regimes[0].get("regime_label", "") or "").strip() or "n/d"
         lines.append(
-            f"{label}: {strategy.get('closed_positions', 0)} cierres | PnL {strategy.get('realized_pnl_usd', '0')} USD | win rate {strategy.get('win_rate_pct', '0')}% | regime {top_regime}"
+            (
+                f"{label}: {strategy.get('closed_positions', 0)} cierres | conv {strategy.get('approval_conversion_pct', '0')}% | "
+                f"PnL {strategy.get('realized_pnl_usd', '0')} USD | expectancy {strategy.get('expectancy_usd', '0')} USD | "
+                f"win rate {strategy.get('win_rate_pct', '0')}% | regime {top_regime}"
+            )
         )
     return lines
