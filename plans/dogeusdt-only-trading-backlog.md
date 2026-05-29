@@ -87,6 +87,76 @@ Operator checklist for the first canary:
 - [ ] Approve only one canary entry.
 - [ ] Monitor the resulting position through the standard status commands until closed.
 
+## 10-Hour Conservative Canary Card
+
+Goal: run a 10-hour live observation window with the full DOGEUSDT discipline path intact, then close with an operator audit regardless of whether the system traded.
+
+Presentation card:
+
+- Window: 10 hours from operator start.
+- Mode: `live`, DOGEUSDT-only, premium active, trade approval mandatory.
+- Objective: observe how the agent behaves in its real environment before any scale-up decision.
+- Exposure: at most one live canary entry, always inside the current notional cap.
+- Acceptable outcome: zero trades is valid if the router, premium gate, approval gate, and audit trail remain healthy.
+
+Operator controls allowed during the window:
+
+- `ANALIZAR DOGE`
+- `ESTADO DOGE`
+- `ESTADO TRADE-...`
+- `APROBAR TRADE-...`
+- `RECHAZAR TRADE-...`
+
+Operator controls not allowed during the window:
+
+- Manual entry proposal creation outside the router path.
+- Disabling premium analysis.
+- Approving more than one new DOGEUSDT canary.
+- Mid-window risk-config changes unless there is an emergency stop reason.
+
+Start-of-window checklist:
+
+- [ ] Confirm `kill_switch_active = false`.
+- [ ] Confirm there is no open DOGEUSDT position.
+- [ ] Confirm there is no stale pending DOGEUSDT approval.
+- [ ] Confirm premium analysis remains enabled.
+- [ ] Record the start timestamp of the 10-hour window.
+
+During-window operator checklist:
+
+- [ ] Wait for router-originated messages; do not front-run the agent.
+- [ ] If a premium-pending setup arrives, run `ANALIZAR DOGE`.
+- [ ] If premium passes, review `ESTADO TRADE-...` before any approval.
+- [ ] Approve at most one canary entry in the full 10-hour window.
+- [ ] If no setup appears, keep the window open and treat that as observed behavior, not as a failure by itself.
+- [ ] Record notable timestamps: premium request, approval creation, approval decision, execution result, and close.
+
+Immediate abort conditions:
+
+- Kill switch becomes active.
+- Premium returns rejection or `alto_riesgo`.
+- Approval expires before review.
+- A DOGEUSDT position already exists when a new entry is proposed.
+- Market structure changes materially between premium review and approval.
+- Container, exchange auth, or messaging behavior becomes inconsistent.
+
+End-of-window audit checklist:
+
+- [ ] Review journal events generated during the 10-hour window.
+- [ ] Count router cycles, premium-pending events, approvals created, approvals approved, approvals rejected, approvals expired, and live executions.
+- [ ] Confirm there was no unauthorized trade path outside premium plus approval.
+- [ ] Confirm every meaningful operator action has a matching audit trail.
+- [ ] Note any delivery lag, stuck states, repeated prompts, or missing transitions.
+- [ ] Record whether the window ended with no trade, a rejected setup, an expired approval, or one completed canary.
+- [ ] Decide: ready for another conservative window, needs fixes before retry, or stop live testing.
+
+Success criteria for the window:
+
+- The system remains inside guardrails for the full 10 hours.
+- Premium and approval remain mandatory for any live entry.
+- No duplicated approvals or duplicated entries occur.
+- The resulting audit trail is complete enough to explain every state transition.
+
 ---
 
 ## Block 1 - Harden Phase 2 Funding Arbitrage
