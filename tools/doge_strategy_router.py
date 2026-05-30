@@ -30,12 +30,18 @@ _STRATEGY_LABELS = {
     "no_trade": "No trade",
 }
 
+_PRICE_DISPLAY_QUANTUM = Decimal("0.00001")
+
 
 def _decimal_text(value: Decimal) -> str:
     normalized = value.normalize()
     if normalized == normalized.to_integral():
         return str(normalized.quantize(Decimal("1")))
     return format(normalized, "f")
+
+
+def _price_text(value: Decimal) -> str:
+    return _decimal_text(value.quantize(_PRICE_DISPLAY_QUANTUM))
 
 
 def strategy_label(strategy_id: str) -> str:
@@ -57,6 +63,99 @@ def _ranked_line(ranked: RankedOpportunity) -> str:
     return f"{ranked.rank}. {label} | bloqueada: {reason}"
 
 
+def _coerce_decimal(value: Any) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _overlay_detail_lines(opportunity: StrategyOpportunity) -> list[str]:
+    if opportunity.strategy_id != "overlay_tactical_long":
+        return []
+
+    signal_payload = opportunity.diagnostic_payload.get("signal")
+    if not isinstance(signal_payload, Mapping):
+        return []
+
+    timeframe = str(signal_payload.get("timeframe") or "15m").strip() or "15m"
+    verdict = str(signal_payload.get("verdict") or "unknown").strip() or "unknown"
+    score = str(signal_payload.get("signal_score") or "n/d").strip() or "n/d"
+
+    last_close = _coerce_decimal(signal_payload.get("last_close"))
+    breakout_reference = _coerce_decimal(signal_payload.get("breakout_reference"))
+    ema_fast = _coerce_decimal(signal_payload.get("ema_fast"))
+    ema_slow = _coerce_decimal(signal_payload.get("ema_slow"))
+    rsi_14 = _coerce_decimal(signal_payload.get("rsi_14"))
+    volume_ratio = _coerce_decimal(signal_payload.get("volume_ratio"))
+
+    price_text = _decimal_text(last_close) if last_close is not None else "n/d"
+    breakout_text = _decimal_text(breakout_reference) if breakout_reference is not None else "n/d"
+    ema_fast_text = _price_text(ema_fast) if ema_fast is not None else "n/d"
+    ema_slow_text = _price_text(ema_slow) if ema_slow is not None else "n/d"
+    rsi_text = _decimal_text(rsi_14.quantize(Decimal("0.01"))) if rsi_14 is not None else "n/d"
+    volume_text = _decimal_text(volume_ratio.quantize(Decimal("0.01"))) if volume_ratio is not None else "n/d"
+
+    lines = [
+        (
+            f"Fase 1 detalle: {timeframe} {score}/7 {verdict} @{price_text} | "
+            f"breakout {breakout_text} | EMA9 {ema_fast_text} | EMA21 {ema_slow_text} | "
+            f"RSI {rsi_text} | vol {volume_text}x"
+        )
+    ]
+    if verdict == "candidate_long":
+        lines.append(
+            f"Fase 1 control: breakout {breakout_text} ya activo; mientras sostenga EMA21 {ema_slow_text}, sigue en radar de entrada."
+        )
+    else:
+        lines.append(
+            f"Fase 1 gatillo: recuperar breakout {breakout_text} con volumen y sostener EMA21 {ema_slow_text}."
+        )
+    return lines
+
+
+def _find_ranked_opportunity(selection: StrategySelection, strategy_id: str) -> RankedOpportunity | None:
+    for ranked in selection.ranked_opportunities:
+        if ranked.opportunity.strategy_id == strategy_id:
+            return ranked
+    return None
+
+
+def build_phase1_overlay_lines(selection: StrategySelection) -> list[str]:
+    ranked_overlay = _find_ranked_opportunity(selection, "overlay_tactical_long")
+    if ranked_overlay is None:
+        return [f"FASE 1: sin lectura overlay disponible ({selection.symbol})."]
+
+    overlay = ranked_overlay.opportunity
+    lines = [f"FASE 1: OVERLAY TACTICO ({overlay.symbol})"]
+    lines.append(
+        "Estado: "
+        f"{'lista' if overlay.eligible else 'en espera'} | "
+        f"macro {overlay.macro_alignment} | regimen {overlay.primary_regime} | "
+        f"horizonte {overlay.holding_horizon} | edge {_decimal_text(overlay.expected_edge)} | "
+        f"confianza {_decimal_text(overlay.confidence)}"
+    )
+
+    detail_lines = _overlay_detail_lines(overlay)
+    if detail_lines:
+        lines.extend(detail_lines)
+    else:
+        lines.append(f"Tesis overlay: {overlay.operator_summary}")
+
+    if selection.abstained:
+        reason = selection.abstain_reason or ranked_overlay.rejection_reason or "; ".join(overlay.blockers) or "sin detalle"
+        lines.append(f"Prioridad router: NO TRADE. {reason}.")
+    elif selection.chosen_strategy_id == "overlay_tactical_long":
+        lines.append("Prioridad router: Fase 1 es la estrategia primaria en este ciclo.")
+    else:
+        reason = ranked_overlay.rejection_reason or "; ".join(overlay.blockers) or "sin detalle"
+        lines.append(
+            f"Prioridad router: {strategy_label(selection.chosen_strategy_id)} -> {selection.chosen_opportunity.action}."
+        )
+        lines.append(f"Fase 1 bloqueo actual: {reason}.")
+    return lines
+
+
 def build_strategy_digest_lines(selection: StrategySelection) -> list[str]:
     chosen = selection.chosen_opportunity
     lines = [f"DOGE STRATEGY ROUTER ({selection.symbol})"]
@@ -67,6 +166,7 @@ def build_strategy_digest_lines(selection: StrategySelection) -> list[str]:
     else:
         lines.append(f"Primaria: {strategy_label(chosen.strategy_id)} -> {chosen.action}.")
         lines.append(f"Tesis: {chosen.operator_summary}")
+        lines.extend(_overlay_detail_lines(chosen))
 
     lines.append(
         "Marco: "
@@ -78,7 +178,9 @@ def build_strategy_digest_lines(selection: StrategySelection) -> list[str]:
     alternatives = list(selection.rejected_alternatives)
     if alternatives:
         lines.append("Alternativas:")
-        lines.extend(_ranked_line(ranked) for ranked in alternatives)
+        for ranked in alternatives:
+            lines.append(_ranked_line(ranked))
+            lines.extend(_overlay_detail_lines(ranked.opportunity))
 
     feedback_result = selection.feedback_result
     if feedback_result is not None and feedback_result.policy.resolved_mode == "shadow":

@@ -26,6 +26,8 @@ from tools.binance_live_adapter import (
 from tools.execution_orchestrators import execute_arbitrage, execute_grid, reconcile_grid
 from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
 from tools.doge_grid_advisor import plan_dynamic_grid
+from tools.doge_strategy_router import build_live_strategy_selection, build_phase1_overlay_lines
+from tools.macro_data_oracle import classify_macro_alignment, fetch_btc_macro_state
 
 from tools.binance_guardrails import (
     BinanceAccountSnapshot,
@@ -260,6 +262,20 @@ def _format_follow_up_line(commands: dict[str, Any], *, include_close: bool = Tr
     return "Seguimiento: " + " | ".join(parts)
 
 
+def _parse_decimal_env(raw_value: str, default: str) -> Decimal:
+    try:
+        return Decimal(str(raw_value or default).strip())
+    except Exception:
+        return Decimal(default)
+
+
+def _parse_int_env(raw_value: str, default: int) -> int:
+    try:
+        return int(str(raw_value or default).strip())
+    except Exception:
+        return default
+
+
 def _trigger_label(trigger: str) -> str:
     normalized = str(trigger or "").strip().lower()
     if normalized == "take_profit":
@@ -351,6 +367,233 @@ def _build_live_entry_whatsapp_message(result: dict[str, Any]) -> str:
             + (f" | AJUSTAR {symbol_shortcut} cuando Hermes lo pida" if symbol_shortcut else "")
         ),
     ]
+    return "\n".join(lines)
+
+
+def _doge_phase1_status_result(symbol: str = "DOGEUSDT") -> dict[str, Any]:
+    snapshot = _doge_phase1_snapshot_result(symbol=symbol)
+    if not snapshot.get("success"):
+        return snapshot
+
+    snapshot["lines"] = build_phase1_overlay_lines(snapshot["selection"])
+    return snapshot
+
+
+def _find_phase1_opportunity(selection: Any) -> Any | None:
+    for ranked in getattr(selection, "ranked_opportunities", ()) or ():
+        opportunity = getattr(ranked, "opportunity", None)
+        if getattr(opportunity, "strategy_id", "") == "overlay_tactical_long":
+            return opportunity
+    return None
+
+
+def _doge_phase1_snapshot_result(symbol: str = "DOGEUSDT") -> dict[str, Any]:
+    _ensure_runtime_env_loaded()
+    normalized_symbol = str(symbol or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+    if normalized_symbol != "DOGEUSDT":
+        return {
+            "success": False,
+            "symbol": normalized_symbol,
+            "error": "La vista de Fase 1 solo esta armada para DOGEUSDT.",
+        }
+
+    timeframe = str(os.getenv("DOGE_AUTONOMOUS_TIMEFRAME", "15m") or "15m").strip() or "15m"
+    notional_usd = _parse_decimal_env(
+        os.getenv("DOGE_AUTONOMOUS_NOTIONAL_USD", os.getenv("BINANCE_RISK_MAX_NOTIONAL_USD", "5.25")),
+        "5.25",
+    )
+    tactical_cap_raw = str(os.getenv("DOGE_AUTONOMOUS_TACTICAL_NOTIONAL_CAP_USD", "") or "").strip()
+    if tactical_cap_raw:
+        notional_usd = min(notional_usd, _parse_decimal_env(tactical_cap_raw, tactical_cap_raw))
+
+    min_signal_score = _parse_int_env(os.getenv("DOGE_AUTONOMOUS_MIN_SIGNAL_SCORE", "5"), 5)
+    selector_minimum_score = _parse_decimal_env(os.getenv("DOGE_SELECTOR_MIN_SCORE", "0.55"), "0.55")
+    selector_conflict_margin = _parse_decimal_env(os.getenv("DOGE_SELECTOR_CONFLICT_MARGIN", "0.08"), "0.08")
+    stop_loss_pct = _parse_decimal_env(os.getenv("DOGE_AUTONOMOUS_STOP_LOSS_PCT", "0.5"), "0.5")
+    take_profit_pct = _parse_decimal_env(os.getenv("DOGE_AUTONOMOUS_TAKE_PROFIT_PCT", "1.0"), "1.0")
+    leverage = _parse_decimal_env(os.getenv("DOGE_AUTONOMOUS_LEVERAGE", "1"), "1")
+
+    try:
+        executor = _get_live_executor(require_credentials=False)
+        macro_snapshot = fetch_btc_macro_state()
+        macro_alignment = classify_macro_alignment(macro_snapshot)
+        selection = build_live_strategy_selection(
+            executor,
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            capital_usd=notional_usd,
+            min_signal_score=min_signal_score,
+            base_macro_alignment=macro_alignment,
+            minimum_score=selector_minimum_score,
+            conflict_margin=selector_conflict_margin,
+        )
+    except BinanceLiveExecutionError as exc:
+        return {"success": False, "symbol": normalized_symbol, "error": str(exc)}
+    except Exception as exc:
+        return {"success": False, "symbol": normalized_symbol, "error": str(exc)}
+
+    return {
+        "success": True,
+        "symbol": normalized_symbol,
+        "timeframe": timeframe,
+        "notional_usd": notional_usd,
+        "stop_loss_pct": stop_loss_pct,
+        "take_profit_pct": take_profit_pct,
+        "leverage": leverage,
+        "selection": selection,
+        "pending_premium_request": get_latest_doge_premium_analysis_request(symbol=normalized_symbol, status="pending"),
+        "pending_approval": get_latest_trade_approval(symbol=normalized_symbol, status="pending"),
+    }
+
+
+def _doge_phase1_simulation_result(
+    symbol: str = "DOGEUSDT",
+    *,
+    requested_mode: str = "auto",
+) -> dict[str, Any]:
+    snapshot = _doge_phase1_snapshot_result(symbol=symbol)
+    if not snapshot.get("success"):
+        return snapshot
+
+    normalized_mode = str(requested_mode or "auto").strip().lower() or "auto"
+    if normalized_mode not in {"auto", "paper", "live"}:
+        return {
+            "success": False,
+            "symbol": str(snapshot.get("symbol") or symbol or "DOGEUSDT").strip().upper() or "DOGEUSDT",
+            "error": "Modo invalido para Fase 1. Usa auto, paper o live.",
+        }
+
+    selection = snapshot["selection"]
+    overlay = _find_phase1_opportunity(selection)
+    lines = build_phase1_overlay_lines(selection)
+    result = {
+        **snapshot,
+        "requested_mode": normalized_mode,
+        "lines": lines,
+        "trade_profile": {
+            "side": "BUY",
+            "notional_usd": snapshot["notional_usd"],
+            "stop_loss_pct": snapshot["stop_loss_pct"],
+            "take_profit_pct": snapshot["take_profit_pct"],
+            "leverage": snapshot["leverage"],
+        },
+        "preview": None,
+        "simulation_note": "",
+    }
+    if overlay is None:
+        result["simulation_note"] = "No hay una lectura overlay disponible para simular en este ciclo."
+        return result
+
+    signal_payload = overlay.diagnostic_payload.get("signal") if isinstance(overlay.diagnostic_payload, dict) else {}
+    signal_payload = signal_payload if isinstance(signal_payload, dict) else {}
+    signal_verdict = str(signal_payload.get("verdict") or "").strip().lower()
+    if selection.abstained or selection.chosen_strategy_id != "overlay_tactical_long" or not overlay.eligible or signal_verdict != "candidate_long":
+        result["simulation_note"] = (
+            "No ejecuto la simulacion porque Fase 1 todavia no es la candidata primaria y aprobable del router."
+        )
+        return result
+
+    signal_score = str(signal_payload.get("signal_score") or "n/d").strip() or "n/d"
+    signal_rationale = str(signal_payload.get("rationale") or overlay.operator_summary or "").strip()
+    signal_confidence = Decimal(str(signal_payload.get("verifier_confidence") or overlay.confidence or "0"))
+    base_rationale = (
+        f"DOGE scout {snapshot['timeframe']} score {signal_score}/7. {signal_rationale}. "
+        f"Confianza base {signal_confidence.quantize(Decimal('0.01'))}."
+    )
+    result["preview"] = _submit_trade_result(
+        symbol=str(snapshot["symbol"]),
+        side="BUY",
+        notional_usd=float(snapshot["notional_usd"]),
+        mode=normalized_mode,
+        order_type="MARKET",
+        stop_loss_pct=float(snapshot["stop_loss_pct"]),
+        take_profit_pct=float(snapshot["take_profit_pct"]),
+        leverage=float(snapshot["leverage"]),
+        free_balance_usd=0.0,
+        open_positions=0,
+        positions_in_symbol=0,
+        daily_realized_pnl_usd=0.0,
+        verifier_model="doge-scout-v1",
+        verifier_passed=True,
+        verifier_confidence=float(signal_confidence),
+        rationale=base_rationale,
+        dry_run=True,
+    )
+    return result
+
+
+def _build_doge_phase1_status_whatsapp_message(result: dict[str, Any]) -> str:
+    if not result.get("success"):
+        symbol = str(result.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+        error = str(result.get("error") or "motivo no disponible").strip() or "motivo no disponible"
+        return f"No pude consultar la Fase 1 de {symbol} en este momento: {error}"
+
+    lines = list(result.get("lines") or [])
+    pending_premium_request = result.get("pending_premium_request") or {}
+    pending_approval = result.get("pending_approval") or {}
+    if pending_premium_request:
+        lines.append("Operacion: analisis premium pendiente. Usa ANALIZAR DOGE | ESTADO DOGE.")
+    elif pending_approval:
+        approval_id = str(pending_approval.get("approval_id") or "").strip().upper() or "TRADE-n/d"
+        lines.append(f"Operacion: aprobacion pendiente {approval_id}. Usa ESTADO DOGE | APROBAR DOGE.")
+    else:
+        lines.append("Operacion: sin premium ni aprobacion pendiente en este momento.")
+    lines.append("Seguimiento: VER FASE 1 DOGE | ESTADO FASE 1 DOGE | SIMULAR FASE 1 DOGE | ESTADO DOGE")
+    return "\n".join(lines)
+
+
+def _build_doge_phase1_simulation_whatsapp_message(result: dict[str, Any]) -> str:
+    if not result.get("success"):
+        symbol = str(result.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+        error = str(result.get("error") or "motivo no disponible").strip() or "motivo no disponible"
+        return f"No pude simular la Fase 1 de {symbol} en este momento: {error}"
+
+    symbol = str(result.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+    requested_mode = str(result.get("requested_mode") or "auto").strip().lower() or "auto"
+    trade_profile = result.get("trade_profile") or {}
+    preview = result.get("preview") or {}
+    lines = [f"SIMULACION FASE 1 ({symbol}) | modo solicitado {requested_mode}"]
+    lines.extend(list(result.get("lines") or []))
+    lines.append(
+        "Perfil: "
+        f"BUY | notional {_format_usd_text(trade_profile.get('notional_usd') or '0')} USD | "
+        f"SL {_decimal_text(trade_profile.get('stop_loss_pct') or '0')}% | "
+        f"TP {_decimal_text(trade_profile.get('take_profit_pct') or '0')}% | "
+        f"lev {_decimal_text(trade_profile.get('leverage') or '1')}"
+    )
+
+    simulation_note = str(result.get("simulation_note") or "").strip()
+    if preview:
+        decision = preview.get("decision") or {}
+        proposal = decision.get("proposal") or {}
+        reasons = list(decision.get("reasons") or [])
+        effective_mode = str(proposal.get("mode") or requested_mode).strip().lower() or requested_mode
+        if preview.get("success"):
+            lines.append(f"Validacion: OK | modo efectivo {effective_mode}.")
+            exchange_preview = preview.get("exchange_order_preview") or {}
+            if exchange_preview:
+                lines.append(
+                    "Preview exchange: "
+                    f"ref {_display_price_text(exchange_preview.get('reference_price') or '0')} | "
+                    f"qty {_decimal_text(exchange_preview.get('quantity') or '0')} | "
+                    f"notional {_format_usd_text(exchange_preview.get('estimated_notional_usd') or '0')} USD"
+                )
+        else:
+            reason_text = "; ".join(reasons[:2]) if reasons else str(preview.get("error") or "motivo no disponible")
+            lines.append(f"Validacion: BLOQUEADA | {reason_text}")
+    elif simulation_note:
+        lines.append(f"Simulacion: no ejecutada | {simulation_note}")
+
+    pending_premium_request = result.get("pending_premium_request") or {}
+    pending_approval = result.get("pending_approval") or {}
+    if pending_premium_request:
+        lines.append("Operacion: analisis premium pendiente. Usa ANALIZAR DOGE | ESTADO DOGE.")
+    elif pending_approval:
+        approval_id = str(pending_approval.get("approval_id") or "").strip().upper() or "TRADE-n/d"
+        lines.append(f"Operacion: aprobacion pendiente {approval_id}. Usa ESTADO DOGE | APROBAR DOGE.")
+    else:
+        lines.append("Operacion: simulacion solo lectura; no crea approval ni ejecuta orden.")
+    lines.append("Seguimiento: SIMULAR FASE 1 DOGE | VALIDAR FASE 1 DOGE | ESTADO DOGE")
     return "\n".join(lines)
 
 

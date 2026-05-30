@@ -102,14 +102,21 @@ Presentation card:
 Operator controls allowed during the window:
 
 - `ANALIZAR DOGE`
+- `VER FASE 1 DOGE`
+- `ESTADO FASE 1 DOGE`
+- `SIMULAR FASE 1 DOGE`
+- `VALIDAR FASE 1 DOGE`
 - `ESTADO DOGE`
 - `ESTADO TRADE-...`
+- `APROBAR DOGE`
+- `RECHAZAR DOGE`
 - `APROBAR TRADE-...`
 - `RECHAZAR TRADE-...`
 
 Operator controls not allowed during the window:
 
 - Manual entry proposal creation outside the router path.
+- `APROBAR EVID-...` or `RECHAZAR EVID-...`; `EVID-*` is market evidence, not an approval ID.
 - Disabling premium analysis.
 - Approving more than one new DOGEUSDT canary.
 - Mid-window risk-config changes unless there is an emergency stop reason.
@@ -125,6 +132,7 @@ Start-of-window checklist:
 During-window operator checklist:
 
 - [ ] Wait for router-originated messages; do not front-run the agent.
+- [ ] Use `SIMULAR FASE 1 DOGE` or `VALIDAR FASE 1 DOGE` only as read-only preview; they must not create approvals or orders.
 - [ ] If a premium-pending setup arrives, run `ANALIZAR DOGE`.
 - [ ] If premium passes, review `ESTADO TRADE-...` before any approval.
 - [ ] Approve at most one canary entry in the full 10-hour window.

@@ -444,6 +444,144 @@ class TestSlashCommands:
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_plaintext_phase1_status_symbol_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "_doge_phase1_status_result",
+            lambda **kwargs: {
+                "success": True,
+                "symbol": "DOGEUSDT",
+                "lines": [
+                    "FASE 1: OVERLAY TACTICO (DOGEUSDT)",
+                    "Estado: en espera | macro aligned | regimen quiet_range | horizonte 1h | edge 0.28 | confianza 0.6",
+                    "Fase 1 detalle: 15m 2/7 standby @0.09973 | breakout 0.10036 | EMA9 0.09956 | EMA21 0.09943 | RSI 42.5 | vol 0.6x",
+                    "Fase 1 gatillo: recuperar breakout 0.10036 con volumen y sostener EMA21 0.09943.",
+                    "Prioridad router: ATR grid -> enter.",
+                    "Fase 1 bloqueo actual: signal verdict is standby.",
+                ],
+                "pending_premium_request": None,
+                "pending_approval": None,
+            },
+        )
+
+        send = await send_and_capture(adapter, "VER FASE 1 DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "FASE 1: OVERLAY TACTICO (DOGEUSDT)" in response_text
+        assert "Fase 1 bloqueo actual: signal verdict is standby." in response_text
+        assert "ESTADO FASE 1 DOGE" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_phase1_status_alias_estado_symbol_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            guarded,
+            "_doge_phase1_status_result",
+            lambda **kwargs: {
+                "success": True,
+                "symbol": "DOGEUSDT",
+                "lines": ["FASE 1: OVERLAY TACTICO (DOGEUSDT)"],
+                "pending_premium_request": None,
+                "pending_approval": None,
+            },
+        )
+
+        send = await send_and_capture(adapter, "ESTADO FASE 1 DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "FASE 1: OVERLAY TACTICO (DOGEUSDT)" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_phase1_simulation_freeform_live_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        simulation_result = {
+            "success": True,
+            "symbol": "DOGEUSDT",
+            "requested_mode": "live",
+            "lines": [
+                "FASE 1: OVERLAY TACTICO (DOGEUSDT)",
+                "Prioridad router: Fase 1 es la estrategia primaria en este ciclo.",
+            ],
+            "trade_profile": {
+                "notional_usd": "5.25",
+                "stop_loss_pct": "0.5",
+                "take_profit_pct": "1.0",
+                "leverage": "1",
+            },
+            "preview": {
+                "success": True,
+                "decision": {
+                    "proposal": {"mode": "live"},
+                    "reasons": [],
+                },
+                "exchange_order_preview": {
+                    "reference_price": "0.10010",
+                    "quantity": "52",
+                    "estimated_notional_usd": "5.21",
+                },
+            },
+            "pending_premium_request": None,
+            "pending_approval": None,
+        }
+        simulation_mock = MagicMock(return_value=simulation_result)
+        monkeypatch.setattr(guarded, "_doge_phase1_simulation_result", simulation_mock)
+
+        send = await send_and_capture(adapter, "Simula fase 1 para modo live", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "SIMULACION FASE 1 (DOGEUSDT) | modo solicitado live" in response_text
+        assert "Preview exchange: ref" in response_text
+        assert "qty 52" in response_text
+        assert "notional 5.21 USD" in response_text
+        simulation_mock.assert_called_once_with(symbol="DOGEUSDT", requested_mode="live")
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_approval_evidence_id_returns_guidance(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_market_evidence",
+            lambda evidence_id: {
+                "evidence_id": evidence_id,
+                "symbol": "DOGEUSDT",
+            },
+        )
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_latest_trade_approval",
+            lambda **kwargs: {
+                "approval_id": "TRADE-321",
+                "status": "pending",
+                "symbol": "DOGEUSDT",
+                "evidence_id": "EVID-321",
+            },
+        )
+
+        send = await send_and_capture(adapter, "APROBAR EVID-321", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "EVID-321 es evidencia de mercado, no una aprobacion." in response_text
+        assert "APROBAR TRADE-321" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_plaintext_premium_analysis_symbol_bypasses_agent_loop(self, adapter, runner, platform, monkeypatch):
         import agent.transports.binance_guarded_mcp_server as guarded
 

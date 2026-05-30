@@ -162,6 +162,117 @@ def _configure_router_primary_scout_cycle(monkeypatch, tmp_path, module):
     return selection
 
 
+def _configure_entry_approval_scout_cycle(monkeypatch, tmp_path, module, *, premium_request=None):
+    class _Executor:
+        def fetch_account_overview(self, symbol=None):
+            return {
+                "symbol": symbol,
+                "account_snapshot": {
+                    "free_balance_usd": "1000",
+                    "open_positions": 0,
+                    "positions_in_symbol": 0,
+                    "daily_realized_pnl_usd": "0",
+                    "kill_switch_active": False,
+                },
+            }
+
+    class _Signal(SimpleNamespace):
+        def to_dict(self):
+            payload = {}
+            for key, value in self.__dict__.items():
+                payload[key] = format(value, "f") if isinstance(value, Decimal) else value
+            return payload
+
+    signal = _Signal(
+        symbol="DOGEUSDT",
+        timeframe="15m",
+        last_close=Decimal("0.1010"),
+        ema_fast=Decimal("0.1005"),
+        ema_slow=Decimal("0.0998"),
+        breakout_reference=Decimal("0.1008"),
+        volume_ratio=Decimal("1.20"),
+        signal_score=6,
+        verifier_confidence=Decimal("0.81"),
+        verdict="candidate_long",
+        rationale="DOGE breakout structure remains intact.",
+        market_summary="DOGE is pressing through the recent local range.",
+    )
+    context_signal = _Signal(
+        symbol="DOGEUSDT",
+        timeframe="1h",
+        last_close=Decimal("0.1012"),
+        ema_fast=Decimal("0.1009"),
+        ema_slow=Decimal("0.1001"),
+        breakout_reference=Decimal("0.1005"),
+        volume_ratio=Decimal("1.05"),
+        signal_score=5,
+        verifier_confidence=Decimal("0.75"),
+        verdict="candidate_long",
+        rationale="1h support remains constructive.",
+        market_summary="1h structure stays favorable.",
+    )
+    selection = SimpleNamespace(
+        chosen_strategy_id="overlay_tactical_long",
+        abstained=False,
+        abstain_reason="",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("DOGE_AUTONOMOUS_ANALYSIS_ENABLED", "true")
+    monkeypatch.setenv("BINANCE_RISK_MODE", "live")
+    monkeypatch.setenv("BINANCE_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("DOGE_ROUTER_OWNS_ENTRY_APPROVAL", "false")
+    monkeypatch.setenv("DOGE_AUTONOMOUS_GEMINI_ENABLED", "false")
+    monkeypatch.setenv("DOGE_AUTONOMOUS_POSITION_MANAGEMENT_ENABLED", "false")
+    monkeypatch.setattr(module.guarded, "_ensure_runtime_env_loaded", lambda: None)
+    monkeypatch.setattr(module.guarded, "_doge_premium_analysis_enabled", lambda: True)
+    monkeypatch.setattr(module.BinanceFuturesLiveExecutor, "from_env", staticmethod(lambda require_credentials=True: _Executor()))
+    monkeypatch.setattr(module, "_analyze_timeframe", lambda executor, **kwargs: signal if kwargs.get("interval") == "15m" else context_signal)
+    monkeypatch.setattr(module, "get_latest_trade_approval", lambda **kwargs: None)
+    monkeypatch.setattr(module, "_has_recent_doge_approval", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        module.guarded,
+        "_submit_trade_result",
+        lambda **kwargs: {
+            "success": True,
+            "exchange_order_preview": {
+                "reference_price": "0.10",
+                "quantity": "52",
+                "estimated_notional_usd": "5.25",
+            },
+        },
+    )
+    monkeypatch.setattr(module, "fetch_btc_macro_state", lambda: SimpleNamespace(to_dict=lambda: {"risk_level": "normal", "btc_trend_1h": "bullish", "btc_trend_4h": "bullish", "rationale": "ok"}))
+    monkeypatch.setattr(module, "classify_macro_alignment", lambda snapshot: "aligned")
+    monkeypatch.setattr(module, "record_market_evidence", lambda **kwargs: {"evidence_id": "EVID-1"})
+    monkeypatch.setattr(module, "build_live_strategy_selection", lambda *args, **kwargs: selection)
+    monkeypatch.setattr(
+        module,
+        "build_strategy_decision_context",
+        lambda current_selection, **kwargs: {
+            "selected_strategy": {"strategy_id": current_selection.chosen_strategy_id},
+            "alternatives_considered": [{"strategy_id": "atr_grid"}],
+            "macro_state": kwargs["macro_state"],
+        },
+    )
+    monkeypatch.setattr(module, "material_fingerprint", lambda payload: "PREM-MATCH")
+    monkeypatch.setattr(module, "request_doge_premium_analysis", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should reuse existing premium request")))
+    monkeypatch.setattr(
+        module,
+        "get_latest_doge_premium_analysis_request",
+        lambda **kwargs: None if premium_request is None else {
+            "request_id": "PREM-123",
+            "symbol": "DOGEUSDT",
+            "request_kind": "entry",
+            "model": "gemini-3.5-flash",
+            "event_fingerprint": "PREM-MATCH",
+            **premium_request,
+        },
+    )
+
+    return selection
+
+
 def test_doge_live_scout_degrades_binance_access_errors(monkeypatch, capsys, tmp_path):
     module = _load_doge_live_scout_module()
 
@@ -296,6 +407,58 @@ def test_doge_live_scout_requests_trade_approval_with_selector_context(monkeypat
     assert captured["requested_via"] == "cron_15m_doge"
     assert captured["decision_context"]["selected_strategy"]["strategy_id"] == "overlay_tactical_long"
     assert captured["decision_context"]["alternatives_considered"][0]["strategy_id"] == "atr_grid"
+
+
+def test_doge_live_scout_surfaces_passed_entry_premium_status_before_approval(monkeypatch, tmp_path):
+    module = _load_doge_live_scout_module()
+    _configure_entry_approval_scout_cycle(
+        monkeypatch,
+        tmp_path,
+        module,
+        premium_request={
+            "status": "completed",
+            "analysis_outcome": "passed",
+            "analysis": {
+                "summary": "Gemini 3.5 Flash confirma la entrada.",
+                "confidence": "0.86",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "request_trade_approval",
+        lambda proposal, **kwargs: {"approval_id": "TRADE-1", "expires_at": "2026-05-20T07:00:00+00:00"},
+    )
+
+    result = module.main(emit_output=False)
+
+    assert result["status"] == "approval_created"
+    assert "Estado premium: Gemini 3.5 Flash confirma DOGEUSDT | Conf 86.00%." in result["lines"]
+    assert "Premium: Gemini 3.5 Flash confirma la entrada." in result["lines"]
+
+
+def test_doge_live_scout_surfaces_denied_entry_premium_fallback_status_before_approval(monkeypatch, tmp_path):
+    module = _load_doge_live_scout_module()
+    _configure_entry_approval_scout_cycle(
+        monkeypatch,
+        tmp_path,
+        module,
+        premium_request={
+            "status": "denied",
+            "analysis_outcome": None,
+            "analysis": {},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "request_trade_approval",
+        lambda proposal, **kwargs: {"approval_id": "TRADE-1", "expires_at": "2026-05-20T07:00:00+00:00"},
+    )
+
+    result = module.main(emit_output=False)
+
+    assert result["status"] == "approval_created"
+    assert "Estado premium: omitido por operador | fallback al flujo actual." in result["lines"]
 
 
 def test_doge_live_scout_defers_entry_approval_to_router_when_configured(monkeypatch, tmp_path):

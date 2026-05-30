@@ -5792,6 +5792,24 @@ class GatewayRunner:
             return normalized[:-4]
         return normalized
 
+    @staticmethod
+    def _normalize_phase1_requested_mode(raw_tokens: list[str]) -> Optional[str]:
+        tokens = [
+            token.strip().upper().rstrip(".,;:!?")
+            for token in raw_tokens
+            if str(token or "").strip()
+        ]
+        tokens = [token for token in tokens if token not in {"PARA", "EN", "DE", "DEL"}]
+        if not tokens:
+            return "auto"
+        if tokens in (["LIVE"], ["MODO", "LIVE"]):
+            return "live"
+        if tokens in (["PAPER"], ["MODO", "PAPER"]):
+            return "paper"
+        if tokens in (["AUTO"], ["MODO", "AUTO"]):
+            return "auto"
+        return None
+
     def _build_trade_approval_status_message(self, approval: dict[str, Any]) -> str:
         from agent.transports import binance_guarded_mcp_server as guarded
 
@@ -5900,6 +5918,91 @@ class GatewayRunner:
             )
             return "No pude ajustar la proteccion live en este momento."
 
+    def _maybe_handle_plaintext_phase1_status(self, event: MessageEvent) -> Optional[str]:
+        try:
+            if event.message_type != MessageType.TEXT:
+                return None
+            text = str(event.text or "").strip()
+            if not text or text.startswith("/"):
+                return None
+            source = getattr(event, "source", None)
+            if getattr(source, "chat_type", None) != "dm":
+                return None
+
+            tokens = [token.strip().upper().rstrip(".,;:!?") for token in text.split() if token.strip()]
+            if len(tokens) < 4:
+                return None
+
+            raw_reference = ""
+            if tokens[:3] == ["VER", "FASE", "1"]:
+                raw_reference = tokens[3]
+            elif tokens[:3] == ["ESTADO", "FASE", "1"]:
+                raw_reference = tokens[3]
+            else:
+                return None
+
+            symbol = self._normalize_trade_symbol_reference(raw_reference)
+            if symbol is None:
+                return None
+
+            from agent.transports import binance_guarded_mcp_server as guarded
+
+            guarded._ensure_runtime_env_loaded()
+            result = guarded._doge_phase1_status_result(symbol=symbol)
+            return guarded._build_doge_phase1_status_whatsapp_message(result)
+        except Exception as exc:
+            logger.warning(
+                "Plaintext Phase 1 status shortcut failed for %r: %s",
+                getattr(event, "text", ""),
+                exc,
+            )
+            return "No pude consultar la Fase 1 de DOGE en este momento."
+
+    def _maybe_handle_plaintext_phase1_simulation(self, event: MessageEvent) -> Optional[str]:
+        try:
+            if event.message_type != MessageType.TEXT:
+                return None
+            text = str(event.text or "").strip()
+            if not text or text.startswith("/"):
+                return None
+            source = getattr(event, "source", None)
+            if getattr(source, "chat_type", None) != "dm":
+                return None
+
+            tokens = [token.strip().upper().rstrip(".,;:!?") for token in text.split() if token.strip()]
+            if len(tokens) < 3 or tokens[1:3] != ["FASE", "1"]:
+                return None
+            if tokens[0] not in {"SIMULA", "SIMULAR", "VALIDA", "VALIDAR"}:
+                return None
+
+            symbol = "DOGEUSDT"
+            remainder = [token for token in tokens[3:] if token not in {"PARA", "EN", "DE", "DEL"}]
+            if remainder and remainder[0] not in {"MODO", "LIVE", "PAPER", "AUTO"}:
+                normalized_symbol = self._normalize_trade_symbol_reference(remainder[0])
+                if normalized_symbol is not None:
+                    symbol = normalized_symbol
+                    remainder = remainder[1:]
+
+            requested_mode = self._normalize_phase1_requested_mode(remainder)
+            if requested_mode is None:
+                return "Uso: SIMULAR FASE 1 DOGE [MODO LIVE|MODO PAPER] o VALIDAR FASE 1 DOGE."
+
+            from agent.transports import binance_guarded_mcp_server as guarded
+
+            guarded._ensure_runtime_env_loaded()
+            result = guarded._doge_phase1_simulation_result(
+                symbol=symbol,
+                requested_mode=requested_mode,
+            )
+            return guarded._build_doge_phase1_simulation_whatsapp_message(result)
+        except Exception as exc:
+            logger.warning(
+                "Plaintext Phase 1 simulation shortcut failed for %r: %s",
+                getattr(event, "text", ""),
+                exc,
+            )
+            return "No pude simular la Fase 1 de DOGE en este momento."
+
     def _maybe_handle_plaintext_paper_trade_status(self, event: MessageEvent) -> Optional[str]:
         try:
             if event.message_type != MessageType.TEXT:
@@ -5973,9 +6076,32 @@ class GatewayRunner:
 
             approval_id = raw_reference.strip().upper().rstrip(".,;:!?")
             from agent.transports import binance_guarded_mcp_server as guarded
-            from tools.binance_paper_runtime import get_latest_trade_approval, get_trade_approval
+            from tools.binance_paper_runtime import get_latest_trade_approval, get_market_evidence, get_trade_approval
 
             guarded._ensure_runtime_env_loaded()
+            if approval_id.startswith("EVID-"):
+                evidence = get_market_evidence(approval_id)
+                if evidence is not None:
+                    symbol = str(evidence.get("symbol") or "").strip().upper()
+                    pending = get_latest_trade_approval(symbol=symbol, status="pending") if symbol else None
+                    if pending is not None and str(pending.get("evidence_id") or "").strip().upper() == approval_id:
+                        linked_approval_id = str(pending.get("approval_id") or "").strip().upper() or "TRADE-n/d"
+                        symbol_shortcut = self._trade_symbol_shortcut(symbol)
+                        return (
+                            f"{approval_id} es evidencia de mercado, no una aprobacion. "
+                            f"La aprobacion pendiente ligada es {linked_approval_id}. "
+                            f"Usa {normalized_command} {linked_approval_id} o {normalized_command} {symbol_shortcut}."
+                        )
+                    symbol_shortcut = self._trade_symbol_shortcut(symbol)
+                    return (
+                        f"{approval_id} es evidencia de mercado, no una aprobacion. "
+                        f"Usa ESTADO {symbol_shortcut} para ver la aprobacion vigente y responde {normalized_command} TRADE-... cuando corresponda."
+                    )
+                return (
+                    f"{approval_id} parece un ID de evidencia, no de aprobacion. "
+                    f"Usa ESTADO DOGE o {normalized_command} TRADE-..."
+                )
+
             if not approval_id.startswith("TRADE-"):
                 symbol = self._normalize_trade_symbol_reference(approval_id)
                 if symbol is None:
@@ -6347,6 +6473,14 @@ class GatewayRunner:
         _live_trade_adjustment_shortcut = self._maybe_handle_plaintext_live_trade_adjustment(event)
         if _live_trade_adjustment_shortcut is not None:
             return _live_trade_adjustment_shortcut
+
+        _phase1_status_shortcut = self._maybe_handle_plaintext_phase1_status(event)
+        if _phase1_status_shortcut is not None:
+            return _phase1_status_shortcut
+
+        _phase1_simulation_shortcut = self._maybe_handle_plaintext_phase1_simulation(event)
+        if _phase1_simulation_shortcut is not None:
+            return _phase1_simulation_shortcut
 
         _paper_status_shortcut = self._maybe_handle_plaintext_paper_trade_status(event)
         if _paper_status_shortcut is not None:

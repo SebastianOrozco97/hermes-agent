@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from tools.doge_strategy_router import build_strategy_decision_context, build_strategy_digest_lines
+from tools.doge_strategy_router import build_phase1_overlay_lines, build_strategy_decision_context, build_strategy_digest_lines
 from tools.doge_strategy_selector import SelectorFeedbackPolicy, StrategyOpportunity, attach_selector_feedback, select_doge_strategy
 
 
@@ -194,3 +194,178 @@ def test_strategy_router_digest_surfaces_shadow_feedback_when_present():
     lines = build_strategy_digest_lines(selection)
 
     assert any("Shadow feedback: habria priorizado ATR grid" in line for line in lines)
+
+
+def test_strategy_router_digest_surfaces_phase1_detail_when_overlay_is_blocked():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.28",
+        confidence="0.60",
+        eligible=False,
+        blockers=("signal verdict is standby",),
+        primary_regime="quiet_range",
+        diagnostic_payload={
+            "signal": {
+                "timeframe": "15m",
+                "signal_score": 2,
+                "verdict": "standby",
+                "last_close": "0.09973",
+                "breakout_reference": "0.10036",
+                "ema_fast": "0.09956",
+                "ema_slow": "0.09943",
+                "rsi_14": "42.50",
+                "volume_ratio": "0.60",
+            }
+        },
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        expected_edge="0.60",
+        confidence="0.70",
+        primary_regime="quiet_range",
+    )
+
+    selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.05"))
+    lines = build_strategy_digest_lines(selection)
+
+    assert any(line.startswith("2. Overlay tactico largo | bloqueada: signal verdict is standby") for line in lines)
+    assert any(
+        line == (
+            "Fase 1 detalle: 15m 2/7 standby @0.09973 | breakout 0.10036 | "
+            "EMA9 0.09956 | EMA21 0.09943 | RSI 42.5 | vol 0.6x"
+        )
+        for line in lines
+    )
+    assert any(
+        line == "Fase 1 gatillo: recuperar breakout 0.10036 con volumen y sostener EMA21 0.09943."
+        for line in lines
+    )
+
+
+def test_strategy_router_digest_surfaces_phase1_detail_when_overlay_is_primary():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.84",
+        confidence="0.82",
+        primary_regime="breakout_trend",
+        diagnostic_payload={
+            "signal": {
+                "timeframe": "15m",
+                "signal_score": 6,
+                "verdict": "candidate_long",
+                "last_close": "0.10072",
+                "breakout_reference": "0.10036",
+                "ema_fast": "0.10021",
+                "ema_slow": "0.09994",
+                "rsi_14": "61.40",
+                "volume_ratio": "1.34",
+            }
+        },
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        expected_edge="0.41",
+        confidence="0.58",
+        primary_regime="quiet_range",
+    )
+
+    selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.05"))
+    lines = build_strategy_digest_lines(selection)
+
+    assert lines[0] == "DOGE STRATEGY ROUTER (DOGEUSDT)"
+    assert any(line.startswith("Primaria: Overlay tactico largo") for line in lines)
+    assert any(
+        line == (
+            "Fase 1 detalle: 15m 6/7 candidate_long @0.10072 | breakout 0.10036 | "
+            "EMA9 0.10021 | EMA21 0.09994 | RSI 61.4 | vol 1.34x"
+        )
+        for line in lines
+    )
+    assert any(
+        line == "Fase 1 control: breakout 0.10036 ya activo; mientras sostenga EMA21 0.09994, sigue en radar de entrada."
+        for line in lines
+    )
+
+
+def test_strategy_router_digest_rounds_high_precision_ema_values():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.28",
+        confidence="0.60",
+        eligible=False,
+        blockers=("signal verdict is standby",),
+        primary_regime="quiet_range",
+        diagnostic_payload={
+            "signal": {
+                "timeframe": "15m",
+                "signal_score": 6,
+                "verdict": "standby",
+                "last_close": "0.10119",
+                "breakout_reference": "0.10126",
+                "ema_fast": "0.1010098642597475882747662996",
+                "ema_slow": "0.1009375854250025288516408667",
+                "rsi_14": "59.70",
+                "volume_ratio": "2.32",
+            }
+        },
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        expected_edge="0.60",
+        confidence="0.70",
+        primary_regime="quiet_range",
+    )
+
+    selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.05"))
+    lines = build_strategy_digest_lines(selection)
+
+    assert any(
+        line == (
+            "Fase 1 detalle: 15m 6/7 standby @0.10119 | breakout 0.10126 | "
+            "EMA9 0.10101 | EMA21 0.10094 | RSI 59.7 | vol 2.32x"
+        )
+        for line in lines
+    )
+    assert any(
+        line == "Fase 1 gatillo: recuperar breakout 0.10126 con volumen y sostener EMA21 0.10094."
+        for line in lines
+    )
+
+
+def test_build_phase1_overlay_lines_surfaces_router_priority_and_blocker():
+    overlay = _synthetic_opportunity(
+        strategy_id="overlay_tactical_long",
+        expected_edge="0.28",
+        confidence="0.60",
+        eligible=False,
+        blockers=("signal verdict is standby",),
+        primary_regime="quiet_range",
+        diagnostic_payload={
+            "signal": {
+                "timeframe": "15m",
+                "signal_score": 2,
+                "verdict": "standby",
+                "last_close": "0.09973",
+                "breakout_reference": "0.10036",
+                "ema_fast": "0.09956",
+                "ema_slow": "0.09943",
+                "rsi_14": "42.50",
+                "volume_ratio": "0.60",
+            }
+        },
+    )
+    grid = _synthetic_opportunity(
+        strategy_id="atr_grid",
+        expected_edge="0.60",
+        confidence="0.70",
+        primary_regime="quiet_range",
+    )
+
+    selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.05"))
+    lines = build_phase1_overlay_lines(selection)
+
+    assert lines[0] == "FASE 1: OVERLAY TACTICO (DOGEUSDT)"
+    assert any(line.startswith("Estado: en espera | macro aligned | regimen quiet_range") for line in lines)
+    assert any(line.startswith("Fase 1 detalle: 15m 2/7 standby @0.09973") for line in lines)
+    assert any(line == "Prioridad router: ATR grid -> enter." for line in lines)
+    assert any(line == "Fase 1 bloqueo actual: signal verdict is standby." for line in lines)
