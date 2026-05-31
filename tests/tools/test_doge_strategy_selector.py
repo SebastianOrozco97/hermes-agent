@@ -225,7 +225,7 @@ def test_build_no_trade_opportunity_requires_blocker_and_zero_capital():
     assert opportunity.to_dict()["diagnostic_payload"]["blocker_count"] == 1
 
 
-def test_selector_prefers_overlay_over_grid_when_score_is_higher():
+def test_selector_prefers_grid_over_overlay_when_range_lane_is_available():
     overlay = overlay_opportunity_from_signal(
         _overlay_signal(verdict="candidate_long", score=6),
         notional_usd=Decimal("5.25"),
@@ -244,9 +244,9 @@ def test_selector_prefers_overlay_over_grid_when_score_is_higher():
     selection = select_doge_strategy((grid, overlay))
 
     assert selection.abstained is False
-    assert selection.chosen_strategy_id == "overlay_tactical_long"
-    assert selection.ranked_opportunities[0].opportunity.strategy_id == "overlay_tactical_long"
-    assert selection.rejected_alternatives[0].opportunity.strategy_id == "atr_grid"
+    assert selection.chosen_strategy_id == "atr_grid"
+    assert selection.ranked_opportunities[0].opportunity.strategy_id == "atr_grid"
+    assert selection.rejected_alternatives[0].opportunity.strategy_id == "overlay_tactical_long"
 
 
 def test_selector_prefers_arbitrage_over_weaker_overlay():
@@ -270,7 +270,7 @@ def test_selector_prefers_arbitrage_over_weaker_overlay():
     assert selection.ranked_opportunities[0].opportunity.strategy_id == "funding_arbitrage"
 
 
-def test_selector_abstains_when_top_strategies_are_too_close():
+def test_selector_uses_phase_hierarchy_before_conflict_gap():
     overlay = _synthetic_opportunity(
         strategy_id="overlay_tactical_long",
         expected_edge="0.70",
@@ -283,6 +283,25 @@ def test_selector_abstains_when_top_strategies_are_too_close():
     )
 
     selection = select_doge_strategy((overlay, grid), conflict_margin=Decimal("0.08"))
+
+    assert selection.abstained is False
+    assert selection.chosen_strategy_id == "atr_grid"
+    assert selection.abstain_reason == ""
+
+
+def test_selector_abstains_when_equal_priority_lanes_are_too_close():
+    lane_a = _synthetic_opportunity(
+        strategy_id="experimental_lane_a",
+        expected_edge="0.70",
+        confidence="0.70",
+    )
+    lane_b = _synthetic_opportunity(
+        strategy_id="experimental_lane_b",
+        expected_edge="0.69",
+        confidence="0.70",
+    )
+
+    selection = select_doge_strategy((lane_a, lane_b), conflict_margin=Decimal("0.08"))
 
     assert selection.abstained is True
     assert selection.chosen_strategy_id == "no_trade"
@@ -332,7 +351,7 @@ def test_selector_abstains_when_sample_size_gate_is_missing():
     assert "funding_arbitrage: sample size gate is not ready" in selection.chosen_opportunity.blockers
 
 
-def test_selector_feedback_shadow_records_rank_flip_without_changing_live_selection():
+def test_selector_feedback_shadow_keeps_phase_hierarchy_even_with_historical_penalties():
     overlay = _synthetic_opportunity(
         strategy_id="overlay_tactical_long",
         expected_edge="0.70",
@@ -373,11 +392,11 @@ def test_selector_feedback_shadow_records_rank_flip_without_changing_live_select
         conflict_margin=Decimal("0.01"),
     )
 
-    assert base_selection.chosen_strategy_id == "overlay_tactical_long"
-    assert feedback_selection.chosen_strategy_id == "overlay_tactical_long"
+    assert base_selection.chosen_strategy_id == "atr_grid"
+    assert feedback_selection.chosen_strategy_id == "atr_grid"
     assert feedback_selection.feedback_result is not None
     assert feedback_selection.feedback_result.shadow_chosen_strategy_id == "atr_grid"
-    assert feedback_selection.feedback_result.shadow_would_change_selection is True
+    assert feedback_selection.feedback_result.shadow_would_change_selection is False
     assert feedback_selection.feedback_result.evaluations[0].policy_action in {"penalize", "boost"}
 
 

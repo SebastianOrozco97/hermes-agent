@@ -332,6 +332,292 @@ def test_submit_trade_result_live_executes_after_approved_live_request(monkeypat
     assert executor.submit_calls
 
 
+def test_strategy_approval_status_message_surfaces_phase_details():
+    approval = {
+        "approval_id": "TRADE-ARB1",
+        "status": "pending",
+        "symbol": "DOGEUSDT",
+        "market_summary": "carry positivo con delta neutral y funding favorable",
+        "decision_context": {
+            "selected_strategy_id": "funding_arbitrage",
+            "selected_strategy": {"strategy_id": "funding_arbitrage"},
+            "execution_request": {
+                "kind": "funding_arbitrage",
+                "strategy_id": "funding_arbitrage",
+                "summary": "carry positivo con delta neutral y funding favorable",
+                "plan": {
+                    "symbol": "DOGEUSDT",
+                    "spot_quantity": "60",
+                    "futures_quantity": "60",
+                    "spot_notional_usd": "6.18",
+                    "futures_margin_usd": "3.09",
+                    "leverage": "2",
+                    "expected_yield_pct": "0.18",
+                    "delta_gap_pct": "0.02",
+                },
+            },
+        },
+    }
+
+    message = guarded._build_paper_status_whatsapp_message(
+        {
+            "status": "approval_pending",
+            "approval": approval,
+            "commands": {
+                "status_trade": "ESTADO TRADE-ARB1",
+                "status_symbol": "ESTADO DOGE",
+                "approve_trade": "APROBAR TRADE-ARB1",
+                "approve_symbol": "APROBAR DOGE",
+                "reject_trade": "RECHAZAR TRADE-ARB1",
+                "reject_symbol": "RECHAZAR DOGE",
+            },
+        }
+    )
+
+    assert "Aprobacion TRADE-ARB1 pendiente" in message
+    assert "Fase 2 Arbitraje de funding" in message
+    assert "APROBAR DOGE" in message
+    assert "Tesis: carry positivo con delta neutral y funding favorable" in message
+
+
+def test_execute_strategy_approval_consumes_live_strategy_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BINANCE_REQUIRE_TRADE_APPROVAL", "true")
+    monkeypatch.setenv("BINANCE_RISK_MODE", "live")
+    monkeypatch.setenv("BINANCE_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("BINANCE_RISK_ALLOWED_SYMBOLS", "DOGEUSDT")
+    monkeypatch.setenv("BINANCE_RISK_MIN_FREE_BALANCE_USD", "2")
+    monkeypatch.setattr(guarded, "_get_live_executor", lambda require_credentials=True: _FakeExecutor())
+    captured = {}
+
+    def _fake_execute_arbitrage(plan, dry_run=False):
+        captured["plan"] = plan
+        captured["dry_run"] = dry_run
+        return {
+            "success": True,
+            "execution_id": "ARB-123",
+            "status": "executed",
+        }
+
+    monkeypatch.setattr(guarded, "execute_arbitrage", _fake_execute_arbitrage)
+
+    proposal = guarded.BinanceTradeProposal.from_payload(
+        {
+            "symbol": "DOGEUSDT",
+            "side": "BUY",
+            "notional_usd": "9.27",
+            "mode": "live",
+            "order_type": "MARKET",
+            "stop_loss_pct": "0.5",
+            "take_profit_pct": "1.0",
+            "leverage": "1",
+            "verifier_model": "gemini-3.5-flash",
+            "verifier_passed": True,
+            "verifier_confidence": "0.92",
+            "dry_run": False,
+        }
+    )
+    approval = request_trade_approval(
+        proposal,
+        market_summary="carry positivo con funding favorable",
+        decision_context={
+            "selected_strategy_id": "funding_arbitrage",
+            "selected_strategy": {"strategy_id": "funding_arbitrage"},
+            "execution_request": {
+                "kind": "funding_arbitrage",
+                "strategy_id": "funding_arbitrage",
+                "summary": "carry positivo con funding favorable",
+                "plan": {
+                    "action": "deploy",
+                    "symbol": "DOGEUSDT",
+                    "spot_quantity": "60",
+                    "futures_quantity": "60",
+                    "leverage": "2",
+                    "spot_notional_usd": "6.18",
+                    "futures_notional_usd": "6.18",
+                    "futures_margin_usd": "3.09",
+                    "delta_gap_pct": "0.02",
+                    "expected_yield_pct": "0.18",
+                    "rationale": "funding favorable y spread controlado",
+                },
+            },
+        },
+        home=tmp_path,
+    )
+    approved = record_trade_approval(approval["approval_id"], decision="approve", home=tmp_path)
+
+    result = guarded._execute_strategy_approval(approved)
+
+    assert result["success"] is True
+    assert result["execution_mode"] == "live-strategy"
+    assert result["approval"]["status"] == "consumed"
+    assert result["strategy_execution_event"]["event_type"] == "live_strategy_executed"
+    assert captured["dry_run"] is False
+    assert captured["plan"].symbol == "DOGEUSDT"
+    assert captured["plan"].expected_yield_pct == Decimal("0.18")
+
+
+def test_execute_strategy_approval_consumes_live_grid_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BINANCE_REQUIRE_TRADE_APPROVAL", "true")
+    monkeypatch.setenv("BINANCE_RISK_MODE", "live")
+    monkeypatch.setenv("BINANCE_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("BINANCE_RISK_ALLOWED_SYMBOLS", "DOGEUSDT")
+    monkeypatch.setenv("BINANCE_RISK_MIN_FREE_BALANCE_USD", "2")
+    monkeypatch.setattr(guarded, "_get_live_executor", lambda require_credentials=True: _FakeExecutor())
+    captured = {}
+
+    def _fake_execute_grid(plan, dry_run=False):
+        captured["plan"] = plan
+        captured["dry_run"] = dry_run
+        return {
+            "success": True,
+            "execution_id": "GRID-123",
+            "orders_placed": 6,
+            "regime": "range_bound",
+            "protective_bounds": {"lower": "0.0970", "upper": "0.1050"},
+        }
+
+    monkeypatch.setattr(guarded, "execute_grid", _fake_execute_grid)
+
+    proposal = guarded.BinanceTradeProposal.from_payload(
+        {
+            "symbol": "DOGEUSDT",
+            "side": "BUY",
+            "notional_usd": "12",
+            "mode": "live",
+            "order_type": "MARKET",
+            "stop_loss_pct": "0.5",
+            "take_profit_pct": "1.0",
+            "leverage": "1",
+            "verifier_model": "gemini-3.5-flash",
+            "verifier_passed": True,
+            "verifier_confidence": "0.84",
+            "dry_run": False,
+        }
+    )
+    approval = request_trade_approval(
+        proposal,
+        market_summary="rango silencioso con ATR contenido",
+        decision_context={
+            "selected_strategy_id": "atr_grid",
+            "selected_strategy": {"strategy_id": "atr_grid"},
+            "execution_request": {
+                "kind": "atr_grid",
+                "strategy_id": "atr_grid",
+                "summary": "rango silencioso con ATR contenido",
+                "plan": {
+                    "symbol": "DOGEUSDT",
+                    "market_price": "0.1010",
+                    "levels": [
+                        {"price": "0.0990", "side": "BUY", "quantity": "20"},
+                        {"price": "0.1030", "side": "SELL", "quantity": "20"},
+                    ],
+                    "total_required_capital": "12",
+                    "stop_loss_price_lower": "0.0970",
+                    "stop_loss_price_upper": "0.1050",
+                    "leverage": "1",
+                    "regime": "range_bound",
+                    "regime_reason": "volatilidad comprimida",
+                    "regime_allows_entry": True,
+                    "rationale": "desplegar grid alrededor del precio medio",
+                },
+            },
+        },
+        home=tmp_path,
+    )
+    approved = record_trade_approval(approval["approval_id"], decision="approve", home=tmp_path)
+
+    result = guarded._execute_strategy_approval(approved)
+
+    assert result["success"] is True
+    assert result["execution_mode"] == "live-strategy"
+    assert result["strategy_id"] == "atr_grid"
+    assert result["approval"]["status"] == "consumed"
+    assert result["strategy_execution_event"]["event_type"] == "live_strategy_executed"
+    assert captured["dry_run"] is False
+    assert captured["plan"].symbol == "DOGEUSDT"
+    assert len(captured["plan"].levels) == 2
+    assert captured["plan"].total_required_capital == Decimal("12")
+
+
+def test_execute_strategy_approval_blocks_when_live_reserve_would_be_breached(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BINANCE_REQUIRE_TRADE_APPROVAL", "true")
+    monkeypatch.setenv("BINANCE_RISK_MODE", "live")
+    monkeypatch.setenv("BINANCE_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("BINANCE_RISK_ALLOWED_SYMBOLS", "DOGEUSDT")
+    monkeypatch.setenv("BINANCE_RISK_MIN_FREE_BALANCE_USD", "2")
+
+    class _TightBalanceExecutor(_FakeExecutor):
+        def fetch_account_overview(self, symbol=None):
+            overview = super().fetch_account_overview(symbol=symbol)
+            overview["account_snapshot"]["free_balance_usd"] = "10"
+            return overview
+
+    executor = _TightBalanceExecutor()
+    monkeypatch.setattr(guarded, "_get_live_executor", lambda require_credentials=True: executor)
+    strategy_call = {"count": 0}
+
+    def _unexpected_execute(plan, dry_run=False):
+        strategy_call["count"] += 1
+        return {"success": True}
+
+    monkeypatch.setattr(guarded, "execute_arbitrage", _unexpected_execute)
+
+    proposal = guarded.BinanceTradeProposal.from_payload(
+        {
+            "symbol": "DOGEUSDT",
+            "side": "BUY",
+            "notional_usd": "9.27",
+            "mode": "live",
+            "order_type": "MARKET",
+            "stop_loss_pct": "0.5",
+            "take_profit_pct": "1.0",
+            "leverage": "1",
+            "verifier_model": "gemini-3.5-flash",
+            "verifier_passed": True,
+            "verifier_confidence": "0.92",
+            "dry_run": False,
+        }
+    )
+    approval = request_trade_approval(
+        proposal,
+        market_summary="carry positivo con funding favorable",
+        decision_context={
+            "selected_strategy_id": "funding_arbitrage",
+            "selected_strategy": {"strategy_id": "funding_arbitrage", "macro_alignment": "aligned"},
+            "execution_request": {
+                "kind": "funding_arbitrage",
+                "strategy_id": "funding_arbitrage",
+                "summary": "carry positivo con funding favorable",
+                "plan": {
+                    "action": "enter_arbitrage",
+                    "symbol": "DOGEUSDT",
+                    "spot_quantity": "60",
+                    "futures_quantity": "60",
+                    "leverage": "2",
+                    "spot_notional_usd": "6.18",
+                    "futures_notional_usd": "6.18",
+                    "futures_margin_usd": "3.09",
+                    "delta_gap_pct": "0.02",
+                    "expected_yield_pct": "0.18",
+                    "rationale": "funding favorable y spread controlado",
+                },
+            },
+        },
+        home=tmp_path,
+    )
+    approved = record_trade_approval(approval["approval_id"], decision="approve", home=tmp_path)
+
+    result = guarded._execute_strategy_approval(approved)
+
+    assert result["success"] is False
+    assert "minimum free balance reserve" in result["error"]
+    assert result["strategy_execution_failure"]["stage"] == "preflight_strategy"
+    assert strategy_call["count"] == 0
+
+
 def test_submit_trade_result_paper_dry_run_allowed_under_live_profile(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("BINANCE_RISK_MODE", "live")

@@ -198,6 +198,47 @@ def test_get_latest_trade_approval_returns_most_recent_match(tmp_path):
     assert lookup_latest["approval_id"] == latest_pending["approval_id"]
 
 
+def test_get_latest_trade_approval_can_filter_by_evidence_id(tmp_path):
+    first_evidence = record_market_evidence(
+        symbol="DOGEUSDT",
+        timeframe="15m",
+        binance_reference_price=Decimal("0.1010"),
+        external_reference_price=Decimal("0.1011"),
+        market_summary="primer setup DOGE",
+        source_urls=["https://www.binance.com/en/futures/DOGEUSDT"],
+        home=tmp_path,
+    )
+    second_evidence = record_market_evidence(
+        symbol="DOGEUSDT",
+        timeframe="15m",
+        binance_reference_price=Decimal("0.1020"),
+        external_reference_price=Decimal("0.1021"),
+        market_summary="segundo setup DOGE",
+        source_urls=["https://www.binance.com/en/futures/DOGEUSDT"],
+        home=tmp_path,
+    )
+
+    linked_first = request_trade_approval(
+        _proposal(symbol="DOGEUSDT", notional_usd="20"),
+        evidence_id=first_evidence["evidence_id"],
+        home=tmp_path,
+    )
+    request_trade_approval(
+        _proposal(symbol="DOGEUSDT", notional_usd="21"),
+        evidence_id=second_evidence["evidence_id"],
+        home=tmp_path,
+    )
+
+    lookup = get_latest_trade_approval(
+        symbol="DOGEUSDT",
+        evidence_id=first_evidence["evidence_id"],
+        home=tmp_path,
+    )
+
+    assert lookup is not None
+    assert lookup["approval_id"] == linked_first["approval_id"]
+
+
 def test_get_latest_trade_approval_expires_stale_approved_unconsumed_record(tmp_path):
     stale_approved = {
         "version": 1,

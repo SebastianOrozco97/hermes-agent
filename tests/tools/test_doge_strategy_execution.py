@@ -16,7 +16,7 @@ from tools.binance_live_adapter import (
     SymbolTradingRules,
 )
 from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
-from tools.doge_grid_advisor import plan_dynamic_grid
+from tools.doge_grid_advisor import GridLevel, GridPlan, plan_dynamic_grid
 from tools.execution_orchestrators import execute_arbitrage, execute_grid, reconcile_grid
 from tools.macro_data_oracle import MacroState, MacroTrend, classify_macro_alignment
 
@@ -227,7 +227,10 @@ def test_plan_dynamic_grid_marks_trending_regime_as_not_enterable():
 
 def test_execute_grid_sets_margin_and_leverage_before_orders(monkeypatch):
     futures = _FakeFuturesExecutor()
-    monkeypatch.setattr("tools.execution_orchestrators.BinanceFuturesLiveExecutor.from_env", lambda: futures)
+    monkeypatch.setattr(
+        "tools.execution_orchestrators.BinanceFuturesLiveExecutor.from_env",
+        lambda *args, **kwargs: futures,
+    )
 
     plan = plan_dynamic_grid(
         symbol="DOGEUSDT",
@@ -247,10 +250,81 @@ def test_execute_grid_sets_margin_and_leverage_before_orders(monkeypatch):
     assert len(futures.order_calls) == len(plan.levels)
 
 
+def test_execute_grid_rejects_when_no_level_meets_exchange_min_notional(monkeypatch):
+    futures = _FakeFuturesExecutor()
+    monkeypatch.setattr(
+        "tools.execution_orchestrators.BinanceFuturesLiveExecutor.from_env",
+        lambda *args, **kwargs: futures,
+    )
+
+    plan = plan_dynamic_grid(
+        symbol="DOGEUSDT",
+        market_price=Decimal("0.10"),
+        atr=Decimal("0.001"),
+        available_capital=Decimal("20"),
+        grids_per_side=3,
+        trend_bias_pct=Decimal("0.002"),
+        leverage=Decimal("1"),
+    )
+
+    result = execute_grid(plan, dry_run=False)
+
+    assert result["success"] is False
+    assert "no deployable levels" in result["error"]
+    assert len(result["rejected_levels"]) == len(plan.levels)
+    assert futures.order_calls == []
+
+
+def test_execute_grid_rejects_partial_seed_after_exchange_normalization(monkeypatch):
+    class _PartialGridFuturesExecutor(_FakeFuturesExecutor):
+        def _get_symbol_rules(self, symbol: str) -> SymbolTradingRules:
+            return SymbolTradingRules(
+                quantity_step=Decimal("50"),
+                price_tick=Decimal("0.000010"),
+                min_notional=Decimal("5"),
+            )
+
+    futures = _PartialGridFuturesExecutor()
+    monkeypatch.setattr(
+        "tools.execution_orchestrators.BinanceFuturesLiveExecutor.from_env",
+        lambda *args, **kwargs: futures,
+    )
+
+    plan = GridPlan(
+        symbol="DOGEUSDT",
+        market_price=Decimal("0.10"),
+        levels=[
+            GridLevel(price=Decimal("0.1010"), side="SELL", quantity=Decimal("60")),
+            GridLevel(price=Decimal("0.1020"), side="SELL", quantity=Decimal("40")),
+            GridLevel(price=Decimal("0.0980"), side="BUY", quantity=Decimal("100")),
+            GridLevel(price=Decimal("0.0970"), side="BUY", quantity=Decimal("40")),
+        ],
+        total_required_capital=Decimal("20"),
+        stop_loss_price_lower=Decimal("0.0950"),
+        stop_loss_price_upper=Decimal("0.1050"),
+        leverage=Decimal("1"),
+        regime="range_bound",
+        regime_reason="manual regression fixture",
+        regime_allows_entry=True,
+        rationale="fixture",
+    )
+
+    result = execute_grid(plan, dry_run=False)
+
+    assert result["success"] is False
+    assert "all planned grid levels must remain deployable" in result["error"]
+    assert len(result["deployable_levels"]) == 2
+    assert len(result["rejected_levels"]) == 2
+    assert futures.order_calls == []
+
+
 def test_reconcile_grid_cancels_orders_and_blocks_reentry(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     futures = _FakeFuturesExecutor()
-    monkeypatch.setattr("tools.execution_orchestrators.BinanceFuturesLiveExecutor.from_env", lambda: futures)
+    monkeypatch.setattr(
+        "tools.execution_orchestrators.BinanceFuturesLiveExecutor.from_env",
+        lambda *args, **kwargs: futures,
+    )
 
     plan = plan_dynamic_grid(
         symbol="DOGEUSDT",

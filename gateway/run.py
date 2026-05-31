@@ -5810,6 +5810,49 @@ class GatewayRunner:
             return "auto"
         return None
 
+    @staticmethod
+    def _looks_like_phase1_analysis_alias(text: str, raw_tokens: list[str]) -> bool:
+        normalized_text = str(text or "").strip().upper()
+        if "FASE 1" not in normalized_text:
+            return False
+        tokens = [
+            token.strip().upper().rstrip(".,;:!?")
+            for token in raw_tokens
+            if str(token or "").strip()
+        ]
+        analysis_cues = any(
+            token.startswith(prefix)
+            for token in tokens
+            for prefix in ("ANALIZ", "ANALIS", "VALID", "SIMUL", "REVIS", "EVALU")
+        )
+        entry_intent_cues = any(
+            token.startswith(prefix)
+            for token in tokens
+            for prefix in ("ENTR", "EJECUT", "ABR", "INVERT")
+        ) or any(token in {"BUY", "SELL", "CORTO", "LARGO"} for token in tokens)
+        return analysis_cues or entry_intent_cues
+
+    @staticmethod
+    def _infer_phase1_requested_mode(raw_tokens: list[str]) -> str:
+        tokens = [
+            token.strip().upper().rstrip(".,;:!?")
+            for token in raw_tokens
+            if str(token or "").strip()
+        ]
+        if "LIVE" in tokens:
+            return "live"
+        if "PAPER" in tokens:
+            return "paper"
+        if "AUTO" in tokens:
+            return "auto"
+        if any(
+            token.startswith(prefix)
+            for token in tokens
+            for prefix in ("ENTR", "EJECUT", "ABR", "INVERT")
+        ) or any(token in {"BUY", "SELL", "CORTO", "LARGO"} for token in tokens):
+            return "live"
+        return "auto"
+
     def _build_trade_approval_status_message(self, approval: dict[str, Any]) -> str:
         from agent.transports import binance_guarded_mcp_server as guarded
 
@@ -5970,20 +6013,27 @@ class GatewayRunner:
                 return None
 
             tokens = [token.strip().upper().rstrip(".,;:!?") for token in text.split() if token.strip()]
-            if len(tokens) < 3 or tokens[1:3] != ["FASE", "1"]:
-                return None
-            if tokens[0] not in {"SIMULA", "SIMULAR", "VALIDA", "VALIDAR"}:
+            explicit_phase1_command = (
+                len(tokens) >= 3
+                and tokens[1:3] == ["FASE", "1"]
+                and tokens[0] in {"SIMULA", "SIMULAR", "VALIDA", "VALIDAR"}
+            )
+            freeform_phase1_alias = self._looks_like_phase1_analysis_alias(text, tokens)
+            if not explicit_phase1_command and not freeform_phase1_alias:
                 return None
 
             symbol = "DOGEUSDT"
-            remainder = [token for token in tokens[3:] if token not in {"PARA", "EN", "DE", "DEL"}]
-            if remainder and remainder[0] not in {"MODO", "LIVE", "PAPER", "AUTO"}:
-                normalized_symbol = self._normalize_trade_symbol_reference(remainder[0])
-                if normalized_symbol is not None:
-                    symbol = normalized_symbol
-                    remainder = remainder[1:]
-
-            requested_mode = self._normalize_phase1_requested_mode(remainder)
+            requested_mode: Optional[str]
+            if explicit_phase1_command:
+                remainder = [token for token in tokens[3:] if token not in {"PARA", "EN", "DE", "DEL"}]
+                if remainder and remainder[0] not in {"MODO", "LIVE", "PAPER", "AUTO"}:
+                    normalized_symbol = self._normalize_trade_symbol_reference(remainder[0])
+                    if normalized_symbol is not None:
+                        symbol = normalized_symbol
+                        remainder = remainder[1:]
+                requested_mode = self._normalize_phase1_requested_mode(remainder)
+            else:
+                requested_mode = self._infer_phase1_requested_mode(tokens)
             if requested_mode is None:
                 return "Uso: SIMULAR FASE 1 DOGE [MODO LIVE|MODO PAPER] o VALIDAR FASE 1 DOGE."
 
@@ -6030,12 +6080,28 @@ class GatewayRunner:
                 premium_request = get_latest_doge_premium_analysis_request(symbol=symbol, status="pending")
                 if premium_request is not None:
                     return guarded._build_doge_premium_status_whatsapp_message(premium_request)
-                approval = get_latest_trade_approval(symbol=symbol, status="pending") or get_latest_trade_approval(symbol=symbol)
+                approval = get_latest_trade_approval(symbol=symbol, status="pending") or get_latest_trade_approval(symbol=symbol, status="approved")
                 if approval is None:
                     premium_request = get_latest_doge_premium_analysis_request(symbol=symbol)
                     if premium_request is not None:
                         return guarded._build_doge_premium_status_whatsapp_message(premium_request)
+                    latest = get_latest_trade_approval(symbol=symbol)
                     symbol_shortcut = self._trade_symbol_shortcut(symbol)
+                    if latest is not None:
+                        latest_id = str(latest.get("approval_id") or "").strip().upper() or "n/d"
+                        latest_status = str(latest.get("status") or "").strip().lower() or "desconocida"
+                        label = {
+                            "pending": "pendiente",
+                            "approved": "aprobada",
+                            "consumed": "ejecutada",
+                            "denied": "rechazada",
+                            "expired": "expirada",
+                        }.get(latest_status, latest_status)
+                        return (
+                            f"No hay una aprobacion vigente para {symbol_shortcut}. "
+                            f"Ultima registrada: {latest_id} ({label}). "
+                            "El scout la revisa cada 15m y te avisara por WhatsApp cuando detecte una nueva entrada."
+                        )
                     return (
                         f"No hay una aprobacion registrada para {symbol_shortcut}. "
                         "El scout la revisa cada 15m y te avisara por WhatsApp cuando detecte una nueva entrada."
@@ -6083,8 +6149,12 @@ class GatewayRunner:
                 evidence = get_market_evidence(approval_id)
                 if evidence is not None:
                     symbol = str(evidence.get("symbol") or "").strip().upper()
-                    pending = get_latest_trade_approval(symbol=symbol, status="pending") if symbol else None
-                    if pending is not None and str(pending.get("evidence_id") or "").strip().upper() == approval_id:
+                    pending = (
+                        get_latest_trade_approval(symbol=symbol, status="pending", evidence_id=approval_id)
+                        if symbol
+                        else get_latest_trade_approval(status="pending", evidence_id=approval_id)
+                    )
+                    if pending is not None:
                         linked_approval_id = str(pending.get("approval_id") or "").strip().upper() or "TRADE-n/d"
                         symbol_shortcut = self._trade_symbol_shortcut(symbol)
                         return (
@@ -6092,10 +6162,37 @@ class GatewayRunner:
                             f"La aprobacion pendiente ligada es {linked_approval_id}. "
                             f"Usa {normalized_command} {linked_approval_id} o {normalized_command} {symbol_shortcut}."
                         )
+                    linked_approval = (
+                        get_latest_trade_approval(symbol=symbol, evidence_id=approval_id)
+                        if symbol
+                        else get_latest_trade_approval(evidence_id=approval_id)
+                    )
                     symbol_shortcut = self._trade_symbol_shortcut(symbol)
+                    if linked_approval is not None:
+                        linked_approval_id = str(linked_approval.get("approval_id") or "").strip().upper() or "TRADE-n/d"
+                        linked_status = str(linked_approval.get("status") or "").strip().lower() or "desconocida"
+                        linked_label = {
+                            "pending": "pendiente",
+                            "approved": "aprobada",
+                            "consumed": "ejecutada",
+                            "denied": "rechazada",
+                            "expired": "expirada",
+                        }.get(linked_status, linked_status)
+                        if linked_status == "approved":
+                            return (
+                                f"{approval_id} es evidencia de mercado, no una aprobacion. "
+                                f"La aprobacion ligada {linked_approval_id} ya fue aprobada. "
+                                f"Usa ESTADO {linked_approval_id} o ESTADO {symbol_shortcut}."
+                            )
+                        return (
+                            f"{approval_id} es evidencia de mercado, no una aprobacion. "
+                            f"La aprobacion ligada {linked_approval_id} ya no esta vigente ({linked_label}). "
+                            f"Usa ESTADO {symbol_shortcut} para ver el estado operativo actual."
+                        )
                     return (
                         f"{approval_id} es evidencia de mercado, no una aprobacion. "
-                        f"Usa ESTADO {symbol_shortcut} para ver la aprobacion vigente y responde {normalized_command} TRADE-... cuando corresponda."
+                        f"No hay una aprobacion pendiente ligada a esta evidencia. "
+                        f"Usa ESTADO {symbol_shortcut} para ver el estado operativo actual."
                     )
                 return (
                     f"{approval_id} parece un ID de evidencia, no de aprobacion. "
@@ -6136,30 +6233,38 @@ class GatewayRunner:
                 responder="operator",
             )
             if normalized_command == "APROBAR":
-                proposal = approval.get("proposal") or {}
-                execution_result = guarded._submit_trade_result(
-                    symbol=str(proposal.get("symbol") or ""),
-                    side=str(proposal.get("side") or ""),
-                    notional_usd=float(proposal.get("notional_usd") or 0.0),
-                    mode=str(proposal.get("mode") or "paper"),
-                    order_type=str(proposal.get("order_type") or "MARKET"),
-                    stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
-                    take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
-                    leverage=float(proposal.get("leverage") or 1.0),
-                    free_balance_usd=0.0,
-                    open_positions=0,
-                    positions_in_symbol=0,
-                    daily_realized_pnl_usd=0.0,
-                    verifier_model=str(proposal.get("verifier_model") or ""),
-                    verifier_passed=bool(proposal.get("verifier_passed")),
-                    verifier_confidence=float(proposal.get("verifier_confidence") or 0.0),
-                    rationale=str(proposal.get("rationale") or ""),
-                    dry_run=False,
-                    approval_id=approval_id,
-                    evidence_id=str(approval.get("evidence_id") or ""),
-                    use_persistent_account=True,
-                    notify_whatsapp=False,
-                )
+                execution_request = guarded._approval_execution_request(approval)
+                strategy_kind = str(execution_request.get("kind") or execution_request.get("strategy_id") or "").strip().lower()
+                if strategy_kind in {"funding_arbitrage", "atr_grid"}:
+                    execution_result = guarded._execute_strategy_approval(
+                        approval,
+                        notify_whatsapp=False,
+                    )
+                else:
+                    proposal = approval.get("proposal") or {}
+                    execution_result = guarded._submit_trade_result(
+                        symbol=str(proposal.get("symbol") or ""),
+                        side=str(proposal.get("side") or ""),
+                        notional_usd=float(proposal.get("notional_usd") or 0.0),
+                        mode=str(proposal.get("mode") or "paper"),
+                        order_type=str(proposal.get("order_type") or "MARKET"),
+                        stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
+                        take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
+                        leverage=float(proposal.get("leverage") or 1.0),
+                        free_balance_usd=0.0,
+                        open_positions=0,
+                        positions_in_symbol=0,
+                        daily_realized_pnl_usd=0.0,
+                        verifier_model=str(proposal.get("verifier_model") or ""),
+                        verifier_passed=bool(proposal.get("verifier_passed")),
+                        verifier_confidence=float(proposal.get("verifier_confidence") or 0.0),
+                        rationale=str(proposal.get("rationale") or ""),
+                        dry_run=False,
+                        approval_id=approval_id,
+                        evidence_id=str(approval.get("evidence_id") or ""),
+                        use_persistent_account=True,
+                        notify_whatsapp=False,
+                    )
                 if execution_result.get("success"):
                     if execution_result.get("execution_mode") == "paper":
                         return guarded._build_paper_entry_whatsapp_message(
@@ -6167,6 +6272,8 @@ class GatewayRunner:
                         )
                     if execution_result.get("execution_mode") == "live":
                         return guarded._build_live_entry_whatsapp_message(execution_result)
+                    if execution_result.get("execution_mode") == "live-strategy":
+                        return guarded._build_strategy_execution_whatsapp_message(execution_result)
                 return (
                     f"Aprobacion {approval_id} aprobada, pero la ejecucion no se completo.\n"
                     f"Motivo: {execution_result.get('error') or 'error desconocido'}\n"

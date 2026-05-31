@@ -43,6 +43,14 @@ def _normalize_macro_alignment(value: str) -> str:
     return str(value or "aligned").strip().lower() or "aligned"
 
 
+_STRATEGY_SELECTION_PRIORITY = {
+    "funding_arbitrage": 0,
+    "atr_grid": 1,
+    "overlay_tactical_long": 2,
+    "no_trade": 99,
+}
+
+
 @dataclass(frozen=True)
 class StrategyOpportunity:
     strategy_id: str
@@ -337,6 +345,22 @@ def overlay_opportunity_from_signal(
     )
 
 
+def _serialize_arbitrage_plan(plan: ArbitragePlan) -> dict[str, Any]:
+    return {
+        "action": str(plan.action or "").strip(),
+        "symbol": str(plan.symbol or "").strip().upper(),
+        "spot_quantity": _decimal_text(plan.spot_quantity),
+        "futures_quantity": _decimal_text(plan.futures_quantity),
+        "leverage": _decimal_text(plan.leverage),
+        "spot_notional_usd": _decimal_text(plan.spot_notional_usd),
+        "futures_notional_usd": _decimal_text(plan.futures_notional_usd),
+        "futures_margin_usd": _decimal_text(plan.futures_margin_usd),
+        "delta_gap_pct": _decimal_text(plan.delta_gap_pct),
+        "expected_yield_pct": _decimal_text(plan.expected_yield_pct),
+        "rationale": str(plan.rationale or "").strip(),
+    }
+
+
 def arbitrage_opportunity_from_plan(
     plan: ArbitragePlan,
     *,
@@ -391,9 +415,33 @@ def arbitrage_opportunity_from_plan(
             "delta_gap_pct": _decimal_text(plan.delta_gap_pct),
             "expected_yield_pct": _decimal_text(plan.expected_yield_pct),
             "rationale": plan.rationale,
+            "plan": _serialize_arbitrage_plan(plan),
         },
         primary_regime=classification.primary_regime,
     )
+
+
+def _serialize_grid_plan(plan: GridPlan) -> dict[str, Any]:
+    return {
+        "symbol": str(plan.symbol or "").strip().upper(),
+        "market_price": _decimal_text(plan.market_price),
+        "levels": [
+            {
+                "price": _decimal_text(level.price),
+                "side": str(level.side or "").strip().upper(),
+                "quantity": _decimal_text(level.quantity),
+            }
+            for level in plan.levels
+        ],
+        "total_required_capital": _decimal_text(plan.total_required_capital),
+        "stop_loss_price_lower": _decimal_text(plan.stop_loss_price_lower),
+        "stop_loss_price_upper": _decimal_text(plan.stop_loss_price_upper),
+        "leverage": _decimal_text(plan.leverage),
+        "regime": str(plan.regime or "").strip(),
+        "regime_reason": str(plan.regime_reason or "").strip(),
+        "regime_allows_entry": bool(plan.regime_allows_entry),
+        "rationale": str(plan.rationale or "").strip(),
+    }
 
 
 def grid_opportunity_from_plan(
@@ -450,6 +498,7 @@ def grid_opportunity_from_plan(
             "stop_loss_price_lower": _decimal_text(plan.stop_loss_price_lower),
             "stop_loss_price_upper": _decimal_text(plan.stop_loss_price_upper),
             "rationale": plan.rationale,
+            "plan": _serialize_grid_plan(plan),
         },
         primary_regime=classification.primary_regime,
     )
@@ -535,9 +584,15 @@ def _selection_score(opportunity: StrategyOpportunity) -> Decimal:
     return _clamp_decimal(score, low=Decimal("0"), high=Decimal("1"))
 
 
+def _strategy_selection_priority(opportunity: StrategyOpportunity) -> int:
+    normalized = str(opportunity.strategy_id or "").strip().lower()
+    return _STRATEGY_SELECTION_PRIORITY.get(normalized, 50)
+
+
 def _rank_sort_key(item: RankedOpportunity) -> tuple[bool, Decimal, Decimal, Decimal, Decimal, str]:
     return (
         not item.eligible_for_selection,
+        _strategy_selection_priority(item.opportunity),
         -item.selection_score,
         -item.opportunity.expected_edge,
         -item.opportunity.confidence,
@@ -653,20 +708,22 @@ def _selection_from_ranked(
 
     if len(eligible_ranked) > 1:
         second_ranked = eligible_ranked[1]
-        score_gap = top_ranked.selection_score - second_ranked.selection_score
-        if score_gap < conflict_margin:
-            abstain_reason = (
-                f"conflicting opportunities {top_ranked.opportunity.strategy_id} and "
-                f"{second_ranked.opportunity.strategy_id} are separated by only {_decimal_text(score_gap)}"
-            )
-            return _build_abstention(
-                symbol=symbol,
-                opportunities=opportunities,
-                ranked_opportunities=ranked_opportunities,
-                blockers=(abstain_reason,),
-                operator_summary="DOGE selector abstained because the leading strategies are too close to call.",
-                abstain_reason=abstain_reason,
-            )
+        same_priority = _strategy_selection_priority(top_ranked.opportunity) == _strategy_selection_priority(second_ranked.opportunity)
+        if same_priority:
+            score_gap = top_ranked.selection_score - second_ranked.selection_score
+            if score_gap < conflict_margin:
+                abstain_reason = (
+                    f"conflicting opportunities {top_ranked.opportunity.strategy_id} and "
+                    f"{second_ranked.opportunity.strategy_id} are separated by only {_decimal_text(score_gap)}"
+                )
+                return _build_abstention(
+                    symbol=symbol,
+                    opportunities=opportunities,
+                    ranked_opportunities=ranked_opportunities,
+                    blockers=(abstain_reason,),
+                    operator_summary="DOGE selector abstained because the leading strategies are too close to call.",
+                    abstain_reason=abstain_reason,
+                )
 
     return StrategySelection(
         symbol=symbol,

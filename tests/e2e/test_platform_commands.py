@@ -392,6 +392,94 @@ class TestSlashCommands:
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_plaintext_trade_approval_symbol_executes_strategy_request(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_latest_trade_approval",
+            lambda **kwargs: {
+                "approval_id": "TRADE-123",
+                "status": "pending",
+                "symbol": "DOGEUSDT",
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "9.27",
+                    "mode": "live",
+                    "order_type": "MARKET",
+                },
+            },
+        )
+        record_approval = MagicMock(
+            return_value={
+                "approval_id": "TRADE-123",
+                "status": "approved",
+                "symbol": "DOGEUSDT",
+                "decision_context": {
+                    "selected_strategy_id": "funding_arbitrage",
+                    "selected_strategy": {"strategy_id": "funding_arbitrage"},
+                    "execution_request": {
+                        "kind": "funding_arbitrage",
+                        "strategy_id": "funding_arbitrage",
+                        "summary": "carry positivo con funding favorable",
+                        "plan": {
+                            "spot_notional_usd": "6.18",
+                            "futures_notional_usd": "6.18",
+                            "futures_margin_usd": "3.09",
+                            "leverage": "2",
+                            "expected_yield_pct": "0.18",
+                            "delta_gap_pct": "0.02",
+                        },
+                    },
+                },
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "9.27",
+                    "mode": "live",
+                    "order_type": "MARKET",
+                },
+            }
+        )
+        submit_trade = MagicMock()
+        monkeypatch.setattr(guarded, "record_trade_approval", record_approval)
+        monkeypatch.setattr(guarded, "_submit_trade_result", submit_trade)
+        monkeypatch.setattr(
+            guarded,
+            "_execute_strategy_approval",
+            lambda approval, notify_whatsapp=False: {
+                "success": True,
+                "execution_mode": "live-strategy",
+                "strategy_id": "funding_arbitrage",
+                "symbol": "DOGEUSDT",
+                "approval": {"approval_id": "TRADE-123", "symbol": "DOGEUSDT"},
+                "execution_request": {
+                    "plan": {
+                        "spot_notional_usd": "6.18",
+                        "futures_notional_usd": "6.18",
+                        "futures_margin_usd": "3.09",
+                        "leverage": "2",
+                        "expected_yield_pct": "0.18",
+                        "delta_gap_pct": "0.02",
+                    }
+                },
+                "execution": {"execution_id": "ARB-123"},
+            },
+        )
+
+        send = await send_and_capture(adapter, "APROBAR DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "Live arbitraje ejecutado DOGEUSDT | TRADE-123" in response_text
+        assert "Yield esp 0.18%" in response_text
+        submit_trade.assert_not_called()
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_plaintext_trade_approval_in_group_stays_plain_text(self, adapter, runner, platform):
         runner._handle_message_with_agent = AsyncMock(return_value="agent-handled")
 
@@ -549,6 +637,88 @@ class TestSlashCommands:
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_plaintext_phase1_analysis_question_routes_to_deterministic_simulation(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        simulation_result = {
+            "success": True,
+            "symbol": "DOGEUSDT",
+            "requested_mode": "live",
+            "lines": [
+                "FASE 1: OVERLAY TACTICO (DOGEUSDT)",
+                "Fase 1 bloqueo actual: signal verdict is standby.",
+            ],
+            "trade_profile": {
+                "notional_usd": "5.25",
+                "stop_loss_pct": "0.5",
+                "take_profit_pct": "1.0",
+                "leverage": "1",
+            },
+            "preview": None,
+            "simulation_note": "No ejecuto la simulacion porque Fase 1 todavia no es la candidata primaria y aprobable del router.",
+            "pending_premium_request": None,
+            "pending_approval": None,
+        }
+        simulation_mock = MagicMock(return_value=simulation_result)
+        monkeypatch.setattr(guarded, "_doge_phase1_simulation_result", simulation_mock)
+
+        send = await send_and_capture(
+            adapter,
+            "Analisa fase 1 para ejecucion en modo live, esta bueno para invertir en este momento?",
+            platform,
+        )
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "SIMULACION FASE 1 (DOGEUSDT) | modo solicitado live" in response_text
+        assert "Fase 1 bloqueo actual: signal verdict is standby." in response_text
+        assert "APROBAR EVID-" not in response_text
+        simulation_mock.assert_called_once_with(symbol="DOGEUSDT", requested_mode="live")
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_phase1_entry_intent_routes_to_deterministic_simulation(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        simulation_result = {
+            "success": True,
+            "symbol": "DOGEUSDT",
+            "requested_mode": "live",
+            "lines": [
+                "FASE 1: OVERLAY TACTICO (DOGEUSDT)",
+                "Fase 1 bloqueo actual: signal verdict is standby.",
+            ],
+            "trade_profile": {
+                "notional_usd": "5.25",
+                "stop_loss_pct": "0.5",
+                "take_profit_pct": "1.0",
+                "leverage": "1",
+            },
+            "preview": None,
+            "simulation_note": "No ejecuto la simulacion porque Fase 1 todavia no es la candidata primaria y aprobable del router.",
+            "pending_premium_request": None,
+            "pending_approval": None,
+        }
+        simulation_mock = MagicMock(return_value=simulation_result)
+        monkeypatch.setattr(guarded, "_doge_phase1_simulation_result", simulation_mock)
+
+        send = await send_and_capture(
+            adapter,
+            "Entremos en corto para la fase 1 con los parametros que propones",
+            platform,
+        )
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "SIMULACION FASE 1 (DOGEUSDT) | modo solicitado live" in response_text
+        assert "Fase 1 bloqueo actual: signal verdict is standby." in response_text
+        assert "APROBAR EVID-" not in response_text
+        simulation_mock.assert_called_once_with(symbol="DOGEUSDT", requested_mode="live")
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_plaintext_trade_approval_evidence_id_returns_guidance(self, adapter, runner, platform, monkeypatch):
         import agent.transports.binance_guarded_mcp_server as guarded
         import tools.binance_paper_runtime as paper_runtime
@@ -579,6 +749,85 @@ class TestSlashCommands:
         response_text = send.call_args[1].get("content") or send.call_args[0][1]
         assert "EVID-321 es evidencia de mercado, no una aprobacion." in response_text
         assert "APROBAR TRADE-321" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_approval_evidence_id_prefers_exact_linked_approval(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(
+            paper_runtime,
+            "get_market_evidence",
+            lambda evidence_id: {
+                "evidence_id": evidence_id,
+                "symbol": "DOGEUSDT",
+            },
+        )
+
+        def _fake_get_latest_trade_approval(**kwargs):
+            if kwargs.get("status") == "pending" and kwargs.get("evidence_id") == "EVID-321":
+                return {
+                    "approval_id": "TRADE-321",
+                    "status": "pending",
+                    "symbol": "DOGEUSDT",
+                    "evidence_id": "EVID-321",
+                }
+            if kwargs.get("status") == "pending" and kwargs.get("symbol") == "DOGEUSDT":
+                return {
+                    "approval_id": "TRADE-999",
+                    "status": "pending",
+                    "symbol": "DOGEUSDT",
+                    "evidence_id": "EVID-999",
+                }
+            return None
+
+        monkeypatch.setattr(paper_runtime, "get_latest_trade_approval", _fake_get_latest_trade_approval)
+
+        send = await send_and_capture(adapter, "APROBAR EVID-321", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "La aprobacion pendiente ligada es TRADE-321" in response_text
+        assert "APROBAR TRADE-321" in response_text
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_trade_status_symbol_does_not_surface_consumed_approval_as_current(self, adapter, runner, platform, monkeypatch):
+        import agent.transports.binance_guarded_mcp_server as guarded
+        import tools.binance_paper_runtime as paper_runtime
+
+        monkeypatch.setattr(guarded, "_ensure_runtime_env_loaded", lambda: None)
+        monkeypatch.setattr(paper_runtime, "get_latest_doge_premium_analysis_request", lambda **kwargs: None)
+
+        def _fake_get_latest_trade_approval(**kwargs):
+            status = kwargs.get("status")
+            if status in {"pending", "approved"}:
+                return None
+            return {
+                "approval_id": "TRADE-OLD321",
+                "status": "consumed",
+                "symbol": "DOGEUSDT",
+                "proposal": {
+                    "symbol": "DOGEUSDT",
+                    "side": "BUY",
+                    "notional_usd": "5.25",
+                    "stop_loss_pct": "0.5",
+                    "take_profit_pct": "1.0",
+                },
+                "market_summary": "tesis vieja que ya no debe salir como vigente",
+            }
+
+        monkeypatch.setattr(paper_runtime, "get_latest_trade_approval", _fake_get_latest_trade_approval)
+
+        send = await send_and_capture(adapter, "ESTADO DOGE", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "No hay una aprobacion vigente para DOGE." in response_text
+        assert "TRADE-OLD321 (ejecutada)" in response_text
+        assert "tesis vieja" not in response_text
         runner._handle_message_with_agent.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -24,9 +24,9 @@ from tools.binance_live_adapter import (
     BinanceLiveExecutionError,
 )
 from tools.execution_orchestrators import execute_arbitrage, execute_grid, reconcile_grid
-from tools.doge_arbitrage_advisor import plan_delta_neutral_arbitrage
-from tools.doge_grid_advisor import plan_dynamic_grid
-from tools.doge_strategy_router import build_live_strategy_selection, build_phase1_overlay_lines
+from tools.doge_arbitrage_advisor import ArbitragePlan, plan_delta_neutral_arbitrage
+from tools.doge_grid_advisor import GridLevel, GridPlan, plan_dynamic_grid
+from tools.doge_strategy_router import build_live_strategy_selection, build_phase1_overlay_lines, strategy_label
 from tools.macro_data_oracle import classify_macro_alignment, fetch_btc_macro_state
 
 from tools.binance_guardrails import (
@@ -53,6 +53,8 @@ from tools.binance_paper_runtime import (
     get_latest_trade_approval,
     get_trade_approval,
     open_paper_position,
+    record_live_strategy_execution_failure,
+    record_live_strategy_execution_success,
     record_live_trade_execution_failure,
     record_live_trade_execution_success,
     record_live_trade_protection_adjustment,
@@ -200,6 +202,13 @@ def _format_usd_text(value: Any) -> str:
 
 def _format_pct_text(value: Any) -> str:
     return _format_fixed_decimal(value, 2)
+
+
+def _decimal_value(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value).strip())
+    except Exception:
+        return Decimal(default)
 
 
 def _operator_timestamp(value: str) -> str:
@@ -368,6 +377,469 @@ def _build_live_entry_whatsapp_message(result: dict[str, Any]) -> str:
         ),
     ]
     return "\n".join(lines)
+
+
+def _approval_decision_context(approval: dict[str, Any]) -> dict[str, Any]:
+    payload = approval.get("decision_context") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _approval_execution_request(approval: dict[str, Any]) -> dict[str, Any]:
+    payload = _approval_decision_context(approval).get("execution_request") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _approval_strategy_id(approval: dict[str, Any]) -> str:
+    decision_context = _approval_decision_context(approval)
+    selected_strategy = decision_context.get("selected_strategy") or {}
+    if not isinstance(selected_strategy, dict):
+        selected_strategy = {}
+    execution_request = _approval_execution_request(approval)
+    return str(
+        execution_request.get("strategy_id")
+        or selected_strategy.get("strategy_id")
+        or decision_context.get("selected_strategy_id")
+        or ""
+    ).strip().lower()
+
+
+def _strategy_required_capital(strategy_id: str, execution_request: dict[str, Any]) -> Decimal:
+    plan_payload = execution_request.get("plan") or {}
+    if strategy_id == "funding_arbitrage":
+        return _decimal_value(plan_payload.get("spot_notional_usd")) + _decimal_value(
+            plan_payload.get("futures_margin_usd")
+        )
+    if strategy_id == "atr_grid":
+        return _decimal_value(plan_payload.get("total_required_capital"))
+    return Decimal("0")
+
+
+def _strategy_leverage(strategy_id: str, execution_request: dict[str, Any]) -> Decimal:
+    plan_payload = execution_request.get("plan") or {}
+    default_strategy = "arbitrage" if strategy_id == "funding_arbitrage" else "grid"
+    return _decimal_value(
+        plan_payload.get("leverage"),
+        default=_decimal_text(get_strategy_leverage_cap(default_strategy)),
+    )
+
+
+def _strategy_macro_alignment(approval: dict[str, Any]) -> str:
+    decision_context = _approval_decision_context(approval)
+    selected_strategy = decision_context.get("selected_strategy") or {}
+    if not isinstance(selected_strategy, dict):
+        selected_strategy = {}
+    execution_request = _approval_execution_request(approval)
+    return str(
+        execution_request.get("macro_alignment")
+        or selected_strategy.get("macro_alignment")
+        or decision_context.get("macro_alignment")
+        or "aligned"
+    ).strip().lower() or "aligned"
+
+
+def _preflight_strategy_execution(approval: dict[str, Any]) -> dict[str, Any]:
+    _ensure_runtime_env_loaded()
+    execution_request = _approval_execution_request(approval)
+    strategy_id = _approval_strategy_id(approval)
+    symbol = str(approval.get("symbol") or (approval.get("proposal") or {}).get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+    limits = BinanceRiskLimits.from_env()
+
+    if limits.mode != "live":
+        return {
+            "success": False,
+            "error": f"strategy approval for {symbol} requires active live mode; current mode is '{limits.mode}'",
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "limits": limits.to_dict(),
+        }
+    if not limits.live_trading_enabled:
+        return {
+            "success": False,
+            "error": "live trading is disabled in the active risk profile",
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "limits": limits.to_dict(),
+        }
+
+    try:
+        executor = _get_live_executor(require_credentials=True)
+        overview = executor.fetch_account_overview(symbol=symbol)
+    except BinanceLiveExecutionError as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "limits": limits.to_dict(),
+        }
+
+    account = BinanceAccountSnapshot.from_payload(overview.get("account_snapshot") or {})
+    required_capital = _strategy_required_capital(strategy_id, execution_request)
+    leverage = _strategy_leverage(strategy_id, execution_request)
+    macro_alignment = _strategy_macro_alignment(approval)
+    reasons: list[str] = []
+
+    if symbol not in limits.allowed_symbols:
+        reasons.append(f"symbol '{symbol}' is outside the allowlist")
+
+    if required_capital <= 0:
+        reasons.append("strategy capital requirement must be greater than zero")
+
+    effective_max_notional = limits.max_notional_usd
+    if macro_alignment == "divergent":
+        effective_max_notional = limits.max_notional_usd * Decimal("0.5")
+    if macro_alignment == "blocked":
+        reasons.append("macro alignment blocks new entries")
+    if required_capital > effective_max_notional:
+        reasons.append(
+            f"strategy capital {required_capital} exceeds effective_max_notional {effective_max_notional} (Macro Alignment: {macro_alignment})"
+        )
+
+    strategy_limit_key = "arbitrage" if strategy_id == "funding_arbitrage" else "grid"
+    strategy_leverage_cap = get_strategy_leverage_cap(strategy_limit_key)
+    if leverage <= 0:
+        reasons.append("strategy leverage must be greater than zero")
+    if leverage > strategy_leverage_cap:
+        reasons.append(
+            f"strategy leverage {leverage} exceeds configured cap {strategy_leverage_cap}"
+        )
+
+    active_kill_switch = is_kill_switch_active() or account.kill_switch_active
+    if active_kill_switch:
+        reasons.append("kill switch is active")
+    if account.open_positions >= limits.max_open_positions:
+        reasons.append(
+            f"open_positions {account.open_positions} meets or exceeds max_open_positions {limits.max_open_positions}"
+        )
+    if account.positions_in_symbol >= limits.max_positions_per_symbol:
+        reasons.append("positions_in_symbol meets or exceeds max_positions_per_symbol")
+    if account.daily_realized_pnl_usd <= (limits.max_daily_loss_usd * Decimal("-1")):
+        reasons.append("daily realized PnL is below the allowed drawdown limit")
+    if (account.free_balance_usd - required_capital) < limits.min_free_balance_usd:
+        reasons.append("strategy would breach the minimum free balance reserve")
+
+    if reasons:
+        return {
+            "success": False,
+            "error": "; ".join(reasons),
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "required_capital_usd": _decimal_text(required_capital),
+            "leverage": _decimal_text(leverage),
+            "macro_alignment": macro_alignment,
+            "live_account_overview": overview,
+            "limits": limits.to_dict(),
+            "reasons": reasons,
+        }
+
+    return {
+        "success": True,
+        "strategy_id": strategy_id,
+        "symbol": symbol,
+        "required_capital_usd": _decimal_text(required_capital),
+        "leverage": _decimal_text(leverage),
+        "macro_alignment": macro_alignment,
+        "live_account_overview": overview,
+        "limits": limits.to_dict(),
+    }
+
+
+def _arbitrage_plan_from_payload(payload: dict[str, Any]) -> ArbitragePlan:
+    return ArbitragePlan(
+        action=str(payload.get("action") or "hold").strip() or "hold",
+        symbol=str(payload.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT",
+        spot_quantity=_decimal_value(payload.get("spot_quantity")),
+        futures_quantity=_decimal_value(payload.get("futures_quantity")),
+        leverage=_decimal_value(payload.get("leverage"), "1"),
+        spot_notional_usd=_decimal_value(payload.get("spot_notional_usd")),
+        futures_notional_usd=_decimal_value(payload.get("futures_notional_usd")),
+        futures_margin_usd=_decimal_value(payload.get("futures_margin_usd")),
+        delta_gap_pct=_decimal_value(payload.get("delta_gap_pct")),
+        expected_yield_pct=_decimal_value(payload.get("expected_yield_pct")),
+        rationale=str(payload.get("rationale") or "").strip(),
+    )
+
+
+def _grid_plan_from_payload(payload: dict[str, Any]) -> GridPlan:
+    levels: list[GridLevel] = []
+    for raw_level in payload.get("levels") or []:
+        if not isinstance(raw_level, dict):
+            continue
+        levels.append(
+            GridLevel(
+                price=_decimal_value(raw_level.get("price")),
+                side=str(raw_level.get("side") or "BUY").strip().upper() or "BUY",
+                quantity=_decimal_value(raw_level.get("quantity")),
+            )
+        )
+    return GridPlan(
+        symbol=str(payload.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT",
+        market_price=_decimal_value(payload.get("market_price")),
+        levels=levels,
+        total_required_capital=_decimal_value(payload.get("total_required_capital")),
+        stop_loss_price_lower=_decimal_value(payload.get("stop_loss_price_lower")),
+        stop_loss_price_upper=_decimal_value(payload.get("stop_loss_price_upper")),
+        leverage=_decimal_value(payload.get("leverage"), "1"),
+        regime=str(payload.get("regime") or "unknown").strip() or "unknown",
+        regime_reason=str(payload.get("regime_reason") or "").strip(),
+        regime_allows_entry=bool(payload.get("regime_allows_entry")),
+        rationale=str(payload.get("rationale") or "").strip(),
+    )
+
+
+def _build_strategy_approval_request_message(approval: dict[str, Any]) -> Optional[str]:
+    execution_request = _approval_execution_request(approval)
+    strategy_id = _approval_strategy_id(approval)
+    approval_id = str(approval.get("approval_id") or "").strip().upper() or "n/d"
+    expires_at = _operator_timestamp(str(approval.get("expires_at") or ""))
+    symbol = str(approval.get("symbol") or (approval.get("proposal") or {}).get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+    symbol_shortcut = _symbol_shortcut(symbol)
+    summary = str(execution_request.get("summary") or approval.get("market_summary") or "").strip()
+    lines: list[str] = []
+
+    if strategy_id == "funding_arbitrage":
+        plan_payload = execution_request.get("plan") or {}
+        lines.append(f"Aprobacion requerida {approval_id} | Fase 2 {strategy_label(strategy_id)}")
+        lines.append(
+            f"Capital {_format_usd_text(plan_payload.get('spot_notional_usd') or '0')} + margen {_format_usd_text(plan_payload.get('futures_margin_usd') or '0')} USD | Lev {_decimal_text(plan_payload.get('leverage') or '1')} | Yield esp {_format_pct_text(plan_payload.get('expected_yield_pct') or '0')}% | Gap delta {_format_pct_text(plan_payload.get('delta_gap_pct') or '0')}%"
+        )
+        lines.append(
+            f"Spot {_decimal_text(plan_payload.get('spot_quantity') or '0')} DOGE | Futures {_decimal_text(plan_payload.get('futures_quantity') or '0')} DOGE | Simbolo {symbol}"
+        )
+    elif strategy_id == "atr_grid":
+        plan_payload = execution_request.get("plan") or {}
+        level_count = len(plan_payload.get("levels") or [])
+        lines.append(f"Aprobacion requerida {approval_id} | Fase 3 {strategy_label(strategy_id)}")
+        lines.append(
+            f"Capital {_format_usd_text(plan_payload.get('total_required_capital') or '0')} USD | Regimen {plan_payload.get('regime') or 'unknown'} | {level_count} ordenes | Lev {_decimal_text(plan_payload.get('leverage') or '1')}"
+        )
+        lines.append(
+            f"Bounds {_display_price_text(plan_payload.get('stop_loss_price_lower'))} - {_display_price_text(plan_payload.get('stop_loss_price_upper'))} | Simbolo {symbol}"
+        )
+    else:
+        return None
+
+    if expires_at != "n/d":
+        lines.append(f"Expira {expires_at}")
+    if summary:
+        lines.append(f"Tesis: {summary}")
+    lines.append(f"Comandos: APROBAR {symbol_shortcut} | RECHAZAR {symbol_shortcut} | ESTADO {symbol_shortcut}")
+    lines.append(f"Exacto: APROBAR {approval_id} | RECHAZAR {approval_id} | ESTADO {approval_id}")
+    return "\n".join(lines)
+
+
+def _build_strategy_execution_whatsapp_message(result: dict[str, Any]) -> str:
+    strategy_id = str(result.get("strategy_id") or "").strip().lower()
+    approval = result.get("approval") or {}
+    approval_id = str(approval.get("approval_id") or result.get("approval_id") or "").strip().upper() or "sin approval id"
+    execution_request = result.get("execution_request") or {}
+    execution = result.get("execution") or {}
+    symbol = str(result.get("symbol") or approval.get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+
+    if strategy_id == "funding_arbitrage":
+        plan_payload = execution_request.get("plan") or {}
+        lines = [
+            f"Live arbitraje ejecutado {symbol} | {approval_id}",
+            f"Spot {_format_usd_text(plan_payload.get('spot_notional_usd') or '0')} USD | Futures {_format_usd_text(plan_payload.get('futures_notional_usd') or '0')} USD | Margen {_format_usd_text(plan_payload.get('futures_margin_usd') or '0')} USD | Lev {_decimal_text(plan_payload.get('leverage') or '1')}",
+            f"Yield esp {_format_pct_text(plan_payload.get('expected_yield_pct') or '0')}% | Gap delta {_format_pct_text(plan_payload.get('delta_gap_pct') or '0')}% | Exec {execution.get('execution_id') or 'n/d'}",
+            "Seguimiento: esperar siguiente radar 15m",
+        ]
+        return "\n".join(lines)
+
+    if strategy_id == "atr_grid":
+        plan_payload = execution_request.get("plan") or {}
+        protective_bounds = execution.get("protective_bounds") or {}
+        lines = [
+            f"Live grid desplegada {symbol} | {approval_id}",
+            f"Ordenes {execution.get('orders_placed') or 0} | Regimen {execution.get('regime') or plan_payload.get('regime') or 'unknown'} | Capital {_format_usd_text(plan_payload.get('total_required_capital') or '0')} USD",
+            f"Bounds {_display_price_text(protective_bounds.get('lower') or plan_payload.get('stop_loss_price_lower'))} - {_display_price_text(protective_bounds.get('upper') or plan_payload.get('stop_loss_price_upper'))} | Exec {execution.get('execution_id') or 'n/d'}",
+            "Seguimiento: esperar siguiente radar 15m",
+        ]
+        return "\n".join(lines)
+
+    return f"No hay un resumen de ejecucion disponible para {strategy_id or symbol}."
+
+
+def _execute_strategy_approval(
+    approval: dict[str, Any],
+    *,
+    notify_whatsapp: bool = False,
+) -> dict[str, Any]:
+    execution_request = _approval_execution_request(approval)
+    strategy_id = _approval_strategy_id(approval)
+    approval_id = str(approval.get("approval_id") or "").strip().upper()
+    decision_context = _approval_decision_context(approval)
+    symbol = str(approval.get("symbol") or (approval.get("proposal") or {}).get("symbol") or "DOGEUSDT").strip().upper() or "DOGEUSDT"
+
+    preflight = _preflight_strategy_execution(approval)
+    if not preflight.get("success"):
+        strategy_failure_event = record_live_strategy_execution_failure(
+            strategy_id=strategy_id or "unknown",
+            symbol=symbol,
+            approval_id=approval_id,
+            stage="preflight_strategy",
+            error=str(preflight.get("error") or "strategy preflight failed"),
+            details={
+                "execution_request": execution_request,
+                "preflight": preflight,
+            },
+            decision_context=decision_context,
+        )
+        return {
+            "success": False,
+            "execution_mode": "live-strategy",
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "approval": approval,
+            "execution_request": execution_request,
+            "live_account_overview": preflight.get("live_account_overview"),
+            "strategy_execution_failure": strategy_failure_event,
+            "error": preflight.get("error") or "strategy preflight failed",
+        }
+
+    if strategy_id == "funding_arbitrage":
+        preview = execute_arbitrage(
+            _arbitrage_plan_from_payload(execution_request.get("plan") or {}),
+            dry_run=True,
+        )
+        if not preview.get("success"):
+            strategy_failure_event = record_live_strategy_execution_failure(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                approval_id=approval_id,
+                stage="preview_strategy",
+                error=str(preview.get("error") or "strategy preview failed"),
+                details={
+                    "execution_request": execution_request,
+                    "preview": preview,
+                },
+                decision_context=decision_context,
+            )
+            return {
+                "success": False,
+                "execution_mode": "live-strategy",
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "approval": approval,
+                "execution_request": execution_request,
+                "execution": preview,
+                "live_account_overview": preflight.get("live_account_overview"),
+                "strategy_execution_failure": strategy_failure_event,
+                "error": preview.get("error") or "strategy preview failed",
+            }
+        execution = execute_arbitrage(
+            _arbitrage_plan_from_payload(execution_request.get("plan") or {}),
+            dry_run=False,
+        )
+    elif strategy_id == "atr_grid":
+        preview = execute_grid(
+            _grid_plan_from_payload(execution_request.get("plan") or {}),
+            dry_run=True,
+        )
+        if not preview.get("success"):
+            strategy_failure_event = record_live_strategy_execution_failure(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                approval_id=approval_id,
+                stage="preview_strategy",
+                error=str(preview.get("error") or "strategy preview failed"),
+                details={
+                    "execution_request": execution_request,
+                    "preview": preview,
+                },
+                decision_context=decision_context,
+            )
+            return {
+                "success": False,
+                "execution_mode": "live-strategy",
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "approval": approval,
+                "execution_request": execution_request,
+                "execution": preview,
+                "live_account_overview": preflight.get("live_account_overview"),
+                "strategy_execution_failure": strategy_failure_event,
+                "error": preview.get("error") or "strategy preview failed",
+            }
+        execution = execute_grid(
+            _grid_plan_from_payload(execution_request.get("plan") or {}),
+            dry_run=False,
+        )
+    else:
+        return {
+            "success": False,
+            "error": f"approval_id '{approval_id or 'n/d'}' does not carry a supported strategy execution request",
+        }
+
+    if not execution.get("success"):
+        strategy_failure_event = record_live_strategy_execution_failure(
+            strategy_id=strategy_id,
+            symbol=symbol,
+            approval_id=approval_id,
+            error=str(execution.get("error") or "strategy execution failed"),
+            details={
+                "execution_request": execution_request,
+                "execution": execution,
+            },
+            decision_context=decision_context,
+        )
+        return {
+            "success": False,
+            "execution_mode": "live-strategy",
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "approval": approval,
+            "execution_request": execution_request,
+            "execution": execution,
+            "strategy_execution_failure": strategy_failure_event,
+            "error": execution.get("error") or "strategy execution failed",
+        }
+
+    approval_record = consume_trade_approval(approval_id)
+    strategy_execution_event = record_live_strategy_execution_success(
+        strategy_id=strategy_id,
+        symbol=symbol,
+        approval_id=approval_id,
+        evidence_id=str(approval.get("evidence_id") or ""),
+        execution=execution,
+        details={"execution_request": execution_request},
+        decision_context=decision_context,
+    )
+    result = {
+        "success": True,
+        "execution_mode": "live-strategy",
+        "strategy_id": strategy_id,
+        "symbol": symbol,
+        "approval": approval_record,
+        "execution_request": execution_request,
+        "live_account_overview": preflight.get("live_account_overview"),
+        "execution": execution,
+        "strategy_execution_event": strategy_execution_event,
+    }
+    if notify_whatsapp:
+        result["whatsapp_notification"] = _send_whatsapp_home_message(
+            _build_strategy_execution_whatsapp_message(result)
+        )
+    return result
+
+
+def _build_trade_approval_whatsapp_message(approval: dict[str, Any]) -> str:
+    strategy_message = _build_strategy_approval_request_message(approval)
+    if strategy_message is not None:
+        return strategy_message
+
+    proposal = approval.get("proposal") or {}
+    symbol = str(proposal.get("symbol") or approval.get("symbol") or "DOGEUSDT")
+    return _build_paper_approval_whatsapp_message(
+        approval_id=str(approval.get("approval_id") or ""),
+        symbol=symbol,
+        side=str(proposal.get("side") or "BUY"),
+        notional_usd=float(proposal.get("notional_usd") or 0.0),
+        stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
+        take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
+        expires_at=str(approval.get("expires_at") or ""),
+        symbol_shortcut=_symbol_shortcut(str(proposal.get("symbol") or symbol)),
+    )
 
 
 def _doge_phase1_status_result(symbol: str = "DOGEUSDT") -> dict[str, Any]:
@@ -893,17 +1365,7 @@ def _build_doge_premium_resolution_whatsapp_message(result: dict[str, Any]) -> s
             )
         if request_kind == "entry":
             approval = result.get("trade_approval") or {}
-            proposal = approval.get("proposal") or {}
-            body = _build_paper_approval_whatsapp_message(
-                approval_id=str(approval.get("approval_id") or ""),
-                symbol=str(proposal.get("symbol") or symbol),
-                side=str(proposal.get("side") or "BUY"),
-                notional_usd=float(proposal.get("notional_usd") or 0.0),
-                stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
-                take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
-                expires_at=str(approval.get("expires_at") or ""),
-                symbol_shortcut=_symbol_shortcut(str(proposal.get("symbol") or symbol)),
-            )
+            body = _build_trade_approval_whatsapp_message(approval)
             return intro + "\n" + body
         return _build_doge_adjustment_ready_message(
             request.get("material_payload") or {},
@@ -913,7 +1375,6 @@ def _build_doge_premium_resolution_whatsapp_message(result: dict[str, Any]) -> s
     if outcome == "passed":
         if request_kind == "entry":
             approval = result.get("trade_approval") or {}
-            proposal = approval.get("proposal") or {}
             intro_lines = [
                 f"{request_model} confirma entrada {symbol} | Conf {_format_pct_text(Decimal(str(assessment.get('confidence') or '0')) * Decimal('100'))}%",
                 f"Resumen: {assessment.get('summary') or 'setup valido'}",
@@ -929,16 +1390,7 @@ def _build_doge_premium_resolution_whatsapp_message(result: dict[str, Any]) -> s
             if risk_flags:
                 intro_lines.append("Riesgos: " + ", ".join(str(item) for item in risk_flags))
             intro_lines.append(f"Operador: {assessment.get('operator_note') or 'n/d'}")
-            body = _build_paper_approval_whatsapp_message(
-                approval_id=str(approval.get("approval_id") or ""),
-                symbol=str(proposal.get("symbol") or symbol),
-                side=str(proposal.get("side") or "BUY"),
-                notional_usd=float(proposal.get("notional_usd") or 0.0),
-                stop_loss_pct=float(proposal.get("stop_loss_pct") or 0.0),
-                take_profit_pct=float(proposal.get("take_profit_pct") or 0.0),
-                expires_at=str(approval.get("expires_at") or ""),
-                symbol_shortcut=_symbol_shortcut(str(proposal.get("symbol") or symbol)),
-            )
+            body = _build_trade_approval_whatsapp_message(approval)
             return "\n".join(intro_lines + [body])
         intro = f"{request_model} valida el ajuste DOGE | Conf {_format_pct_text(Decimal(str(assessment.get('confidence') or '0')) * Decimal('100'))}%"
         return _build_doge_adjustment_ready_message(
@@ -1121,6 +1573,48 @@ def _build_paper_status_whatsapp_message(status: dict[str, Any]) -> str:
 
     if normalized_status.startswith("approval_"):
         approval = status.get("approval") or {}
+        strategy_request_message = _build_strategy_approval_request_message(approval)
+        if strategy_request_message is not None:
+            commands = status.get("commands") or {}
+            approval_id = str(approval.get("approval_id") or "").strip() or "n/d"
+            approval_state = str(approval.get("status") or normalized_status.removeprefix("approval_") or "unknown").strip().lower()
+            label = {
+                "pending": "pendiente",
+                "approved": "aprobada",
+                "consumed": "ejecutada",
+                "denied": "rechazada",
+                "expired": "expirada",
+            }.get(approval_state, approval_state or "desconocida")
+            strategy_status_lines = strategy_request_message.splitlines()
+            if strategy_status_lines:
+                strategy_status_lines[0] = strategy_status_lines[0].replace(
+                    f"Aprobacion requerida {approval_id}",
+                    f"Aprobacion {approval_id} {label}",
+                    1,
+                )
+            follow_up_parts: list[str] = []
+            status_trade = str(commands.get("status_trade", "") or "").strip()
+            status_symbol = str(commands.get("status_symbol", "") or "").strip()
+            approve_trade = str(commands.get("approve_trade", "") or "").strip()
+            approve_symbol = str(commands.get("approve_symbol", "") or "").strip()
+            reject_trade = str(commands.get("reject_trade", "") or "").strip()
+            reject_symbol = str(commands.get("reject_symbol", "") or "").strip()
+            if status_trade:
+                follow_up_parts.append(status_trade)
+            if status_symbol and status_symbol not in follow_up_parts:
+                follow_up_parts.append(status_symbol)
+            if approval_state == "pending" and approve_trade:
+                follow_up_parts.append(approve_trade)
+            if approval_state == "pending" and approve_symbol and approve_symbol not in follow_up_parts:
+                follow_up_parts.append(approve_symbol)
+            if approval_state == "pending" and reject_trade:
+                follow_up_parts.append(reject_trade)
+            if approval_state == "pending" and reject_symbol and reject_symbol not in follow_up_parts:
+                follow_up_parts.append(reject_symbol)
+            if follow_up_parts:
+                strategy_status_lines.append("Seguimiento: " + " | ".join(follow_up_parts))
+            return "\n".join(strategy_status_lines)
+
         proposal = approval.get("proposal") or {}
         commands = status.get("commands") or {}
         approval_id = str(approval.get("approval_id") or "").strip() or "n/d"
@@ -1128,6 +1622,7 @@ def _build_paper_status_whatsapp_message(status: dict[str, Any]) -> str:
         label = {
             "pending": "pendiente",
             "approved": "aprobada",
+            "consumed": "ejecutada",
             "denied": "rechazada",
             "expired": "expirada",
         }.get(approval_state, approval_state or "desconocida")

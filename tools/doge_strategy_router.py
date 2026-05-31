@@ -235,6 +235,7 @@ def build_strategy_decision_context(
     macro_state: Mapping[str, Any] | None = None,
     verifier_assessments: Mapping[str, Any] | None = None,
     market_context: Mapping[str, Any] | None = None,
+    execution_request: Mapping[str, Any] | None = None,
     selector_family: str = "doge_meta_selector_v1",
 ) -> dict[str, Any]:
     alternatives: list[dict[str, Any]] = []
@@ -262,6 +263,7 @@ def build_strategy_decision_context(
         "macro_state": _normalize_json_payload(macro_state or {}),
         "verifier_assessments": _normalize_json_payload(verifier_assessments or {}),
         "market_context": _normalize_json_payload(market_context or {}),
+        "execution_request": _normalize_json_payload(execution_request or {}),
         "selector_feedback": selection.feedback_result.to_dict() if selection.feedback_result is not None else None,
     }
 

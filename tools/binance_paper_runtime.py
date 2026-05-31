@@ -1749,6 +1749,58 @@ def record_live_trade_execution_success(
     return record
 
 
+def record_live_strategy_execution_failure(
+    *,
+    strategy_id: str,
+    symbol: str,
+    error: str,
+    approval_id: str = "",
+    stage: str = "execute_strategy",
+    details: Optional[dict[str, Any]] = None,
+    decision_context: Optional[Mapping[str, Any]] = None,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    record = {
+        "event_type": "live_strategy_execution_failed",
+        "recorded_at": _now_iso(),
+        "strategy_id": str(strategy_id or "").strip().lower() or "unknown",
+        "approval_id": str(approval_id or "").strip().upper() or None,
+        "symbol": str(symbol or "").strip().upper(),
+        "stage": str(stage or "execute_strategy").strip() or "execute_strategy",
+        "error": str(error or "").strip() or "unknown strategy execution error",
+        "details": _normalize_json_payload(details) if details else None,
+        "decision_context": _normalize_decision_context(decision_context),
+    }
+    _append_jsonl(get_paper_journal_path(home=home), record)
+    return record
+
+
+def record_live_strategy_execution_success(
+    *,
+    strategy_id: str,
+    symbol: str,
+    execution: Mapping[str, Any],
+    approval_id: str = "",
+    evidence_id: str = "",
+    details: Optional[dict[str, Any]] = None,
+    decision_context: Optional[Mapping[str, Any]] = None,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    record = {
+        "event_type": "live_strategy_executed",
+        "recorded_at": _now_iso(),
+        "strategy_id": str(strategy_id or "").strip().lower() or "unknown",
+        "approval_id": str(approval_id or "").strip().upper() or None,
+        "symbol": str(symbol or "").strip().upper(),
+        "evidence_id": str(evidence_id or "").strip().upper() or None,
+        "execution": _normalize_json_payload(execution),
+        "details": _normalize_json_payload(details) if details else None,
+        "decision_context": _normalize_decision_context(decision_context),
+    }
+    _append_jsonl(get_paper_journal_path(home=home), record)
+    return record
+
+
 def record_live_trade_protection_adjustment(
     *,
     symbol: str,
@@ -1873,10 +1925,12 @@ def get_latest_trade_approval(
     *,
     symbol: str = "",
     status: str = "",
+    evidence_id: str = "",
     home: Optional[Path] = None,
 ) -> Optional[dict[str, Any]]:
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_status = str(status or "").strip().lower()
+    normalized_evidence_id = str(evidence_id or "").strip().upper()
     payload = _load_approvals(home=home)
     approvals = payload.get("approvals", [])
     dirty = False
@@ -1892,9 +1946,12 @@ def get_latest_trade_approval(
     for record in reversed(approvals):
         record_symbol = str(record.get("symbol", "") or "").strip().upper()
         record_status = str(record.get("status", "") or "").strip().lower()
+        record_evidence_id = str(record.get("evidence_id", "") or "").strip().upper()
         if normalized_symbol and record_symbol != normalized_symbol:
             continue
         if normalized_status and record_status != normalized_status:
+            continue
+        if normalized_evidence_id and record_evidence_id != normalized_evidence_id:
             continue
         return record
     return None
@@ -1920,13 +1977,22 @@ def validate_trade_approval(
 
 def consume_trade_approval(
     approval_id: str,
-    proposal: BinanceTradeProposal,
+    proposal: Optional[BinanceTradeProposal] = None,
     *,
     home: Optional[Path] = None,
 ) -> dict[str, Any]:
-    ok, error, record = validate_trade_approval(approval_id, proposal, home=home)
-    if not ok or record is None:
-        raise ValueError(error)
+    if proposal is None:
+        record = get_trade_approval(approval_id, home=home)
+        normalized_id = str(approval_id or "").strip().upper()
+        if record is None:
+            raise ValueError(f"approval_id '{normalized_id}' was not found")
+        status = str(record.get("status", "")).strip().lower()
+        if status != "approved":
+            raise ValueError(f"approval_id '{normalized_id}' is not approved (status: {status or 'unknown'})")
+    else:
+        ok, error, record = validate_trade_approval(approval_id, proposal, home=home)
+        if not ok or record is None:
+            raise ValueError(error)
     payload = _load_approvals(home=home)
     normalized_id = str(approval_id or "").strip().upper()
     for existing in payload.get("approvals", []):

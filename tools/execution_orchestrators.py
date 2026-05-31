@@ -367,6 +367,54 @@ def execute_arbitrage(plan: ArbitragePlan, dry_run: bool = False) -> dict[str, A
         }
 
 
+def _prepare_grid_seed_levels(
+    plan: GridPlan,
+    futures_executor: BinanceFuturesLiveExecutor,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
+    from tools.binance_live_adapter import _quantize_to_step
+
+    rules = futures_executor._get_symbol_rules(plan.symbol)
+    prepared_levels: list[dict[str, Any]] = []
+    rejected_levels: list[dict[str, Any]] = []
+
+    for index, level in enumerate(plan.levels, start=1):
+        qty_clean = _quantize_to_step(level.quantity, rules.quantity_step, rounding="down")
+        price_clean = _quantize_to_step(level.price, rules.price_tick, rounding="up")
+        estimated_notional = qty_clean * price_clean
+        normalized_level = {
+            "index": index,
+            "side": level.side,
+            "price": _format_decimal(price_clean),
+            "quantity": _format_decimal(qty_clean),
+            "estimated_notional": _format_decimal(estimated_notional),
+        }
+
+        if qty_clean <= 0:
+            rejected_levels.append(
+                {
+                    **normalized_level,
+                    "reason": "quantity rounds to zero after exchange step normalization",
+                }
+            )
+            continue
+
+        if estimated_notional < rules.min_notional:
+            rejected_levels.append(
+                {
+                    **normalized_level,
+                    "reason": (
+                        f"estimated notional {_format_decimal(estimated_notional)} is below Binance minimum "
+                        f"{_format_decimal(rules.min_notional)}"
+                    ),
+                }
+            )
+            continue
+
+        prepared_levels.append(normalized_level)
+
+    return prepared_levels, rejected_levels, rules
+
+
 def execute_grid(plan: GridPlan, dry_run: bool = False) -> dict[str, Any]:
     if is_kill_switch_active():
         return {"success": False, "error": "Kill switch is active"}
@@ -382,23 +430,6 @@ def execute_grid(plan: GridPlan, dry_run: bool = False) -> dict[str, Any]:
     if plan.total_required_capital > limits.max_notional_usd:
         return {"success": False, "error": f"Grid required capital {plan.total_required_capital:.2f} exceeds Max Notional Limit {limits.max_notional_usd:.2f}"}
 
-    if dry_run:
-        return {
-            "success": True,
-            "execution_id": _build_grid_execution_id(plan),
-            "mode": "dry_run",
-            "message": f"Grid execution simulated with {len(plan.levels)} levels. Guardrails passed.",
-            "regime": plan.regime,
-            "regime_reason": plan.regime_reason,
-            "protective_bounds": {
-                "lower": float(plan.stop_loss_price_lower),
-                "upper": float(plan.stop_loss_price_upper),
-            },
-            "levels": [{"side": lvl.side, "price": float(lvl.price), "quantity": float(lvl.quantity)} for lvl in plan.levels]
-        }
-
-    futures_executor = BinanceFuturesLiveExecutor.from_env()
-    results = []
     execution_id = _build_grid_execution_id(plan)
     existing_state = _load_grid_states().get(execution_id)
     if isinstance(existing_state, dict):
@@ -417,27 +448,80 @@ def execute_grid(plan: GridPlan, dry_run: bool = False) -> dict[str, Any]:
                 "execution_id": execution_id,
                 "execution_state": existing_state,
             }
+
+    futures_executor = BinanceFuturesLiveExecutor.from_env(require_credentials=not dry_run)
+    prepared_levels, rejected_levels, rules = _prepare_grid_seed_levels(plan, futures_executor)
+
+    if not prepared_levels:
+        return {
+            "success": False,
+            "execution_id": execution_id,
+            "error": "Grid deployment rejected: no deployable levels satisfy exchange minimums",
+            "regime": plan.regime,
+            "regime_reason": plan.regime_reason,
+            "rejected_levels": rejected_levels,
+            "exchange_rules": {
+                "quantity_step": _format_decimal(rules.quantity_step),
+                "price_tick": _format_decimal(rules.price_tick),
+                "min_notional": _format_decimal(rules.min_notional),
+            },
+        }
+    if rejected_levels:
+        return {
+            "success": False,
+            "execution_id": execution_id,
+            "error": "Grid deployment rejected: all planned grid levels must remain deployable after exchange normalization",
+            "regime": plan.regime,
+            "regime_reason": plan.regime_reason,
+            "deployable_levels": prepared_levels,
+            "rejected_levels": rejected_levels,
+            "exchange_rules": {
+                "quantity_step": _format_decimal(rules.quantity_step),
+                "price_tick": _format_decimal(rules.price_tick),
+                "min_notional": _format_decimal(rules.min_notional),
+            },
+        }
+
+    if dry_run:
+        return {
+            "success": True,
+            "execution_id": execution_id,
+            "mode": "dry_run",
+            "message": f"Grid execution simulated with {len(prepared_levels)} validated levels. Guardrails passed.",
+            "regime": plan.regime,
+            "regime_reason": plan.regime_reason,
+            "protective_bounds": {
+                "lower": float(plan.stop_loss_price_lower),
+                "upper": float(plan.stop_loss_price_upper),
+            },
+            "levels": [
+                {
+                    "side": level["side"],
+                    "price": float(level["price"]),
+                    "quantity": float(level["quantity"]),
+                }
+                for level in prepared_levels
+            ],
+        }
+
+    results = []
     try:
         futures_executor.ensure_margin_type(
             plan.symbol,
             os.getenv("BINANCE_GRID_MARGIN_TYPE", "ISOLATED"),
         )
         futures_executor.ensure_leverage(plan.symbol, int(plan.leverage))
-        for lvl in plan.levels:
-            rules = futures_executor._get_symbol_rules(plan.symbol)
-            
-            # Use the global _quantize_to_step function from binance_live_adapter
-            from tools.binance_live_adapter import _quantize_to_step
-            qty_clean = _quantize_to_step(lvl.quantity, rules.quantity_step, rounding="down")
-            price_clean = _quantize_to_step(lvl.price, rules.price_tick, rounding="up")
-
-            # min_qty is not defined in SymbolTradingRules, skip min_quantity check or we only check > 0
-            if qty_clean <= 0 or qty_clean * price_clean < rules.min_notional:
-                continue 
-
+        for level in prepared_levels:
             order = futures_executor._request(
                 "POST", "/fapi/v1/order",
-                params={"symbol": plan.symbol, "side": lvl.side, "type": "LIMIT", "timeInForce": "GTC", "quantity": format(qty_clean, "f"), "price": format(price_clean, "f")},
+                params={
+                    "symbol": plan.symbol,
+                    "side": level["side"],
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "quantity": level["quantity"],
+                    "price": level["price"],
+                },
                 signed=True
             )
             results.append(order)
